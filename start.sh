@@ -19,6 +19,11 @@ else
     exit 1
 fi
 
+# Instalar dependencias con las versiones correctas
+echo "Instalando dependencias..."
+pip install -r requirements.txt --quiet
+echo "Dependencias listas."
+
 # Verificar si ya está corriendo
 if [ -f "$PID_FILE" ]; then
     OLD_PID=$(cat "$PID_FILE")
