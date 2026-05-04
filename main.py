@@ -13,6 +13,9 @@ except ImportError:
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
+async def _empty_dict(): return {}
+async def _empty_list(): return []
+
 from football_api import get_team_last_matches, get_head_to_head, get_team_standing, search_team_by_name
 from odds_api import (get_all_odds, find_odds_for_match,
                       get_todays_events, get_tomorrows_events,
@@ -294,12 +297,12 @@ async def _cmd_pick_from_cache(update: Update, context: ContextTypes.DEFAULT_TYP
          home_susp, away_susp) = await asyncio.gather(
             asyncio.to_thread(get_weather_for_team, home_name),
             asyncio.to_thread(get_match_referee, home_name, away_name),
-            asyncio.to_thread(apifb_season_stats, home_id, league_id_for_extras) if (home_id and league_id_for_extras) else asyncio.coroutine(lambda: {})(),
-            asyncio.to_thread(apifb_season_stats, away_id, league_id_for_extras) if (away_id and league_id_for_extras) else asyncio.coroutine(lambda: {})(),
-            asyncio.to_thread(apifb_get_coach, home_id) if home_id else asyncio.coroutine(lambda: {})(),
-            asyncio.to_thread(apifb_get_coach, away_id) if away_id else asyncio.coroutine(lambda: {})(),
-            asyncio.to_thread(get_suspension_risks, home_id, home_name, sport_key or "") if home_id else asyncio.coroutine(lambda: [])(),
-            asyncio.to_thread(get_suspension_risks, away_id, away_name, sport_key or "") if away_id else asyncio.coroutine(lambda: [])(),
+            asyncio.to_thread(apifb_season_stats, home_id, league_id_for_extras) if (home_id and league_id_for_extras) else _empty_dict(),
+            asyncio.to_thread(apifb_season_stats, away_id, league_id_for_extras) if (away_id and league_id_for_extras) else _empty_dict(),
+            asyncio.to_thread(apifb_get_coach, home_id) if home_id else _empty_dict(),
+            asyncio.to_thread(apifb_get_coach, away_id) if away_id else _empty_dict(),
+            asyncio.to_thread(get_suspension_risks, home_id, home_name, sport_key or "") if home_id else _empty_list(),
+            asyncio.to_thread(get_suspension_risks, away_id, away_name, sport_key or "") if away_id else _empty_list(),
         )
 
         # Stats de árbitro (depende de ref_info)
