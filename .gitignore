@@ -1,0 +1,8 @@
+.env
+*.db
+*.pid
+*.log
+.env
+*.db
+*.pid
+*.log
