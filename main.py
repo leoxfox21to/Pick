@@ -72,25 +72,31 @@ def utc_to_cuba(utc_str):
 
 
 def _esc(text):
-    """Escapa caracteres especiales de Markdown de Telegram en texto variable."""
+    """Escapa caracteres especiales de Telegram Markdown en texto variable (_, *, `, [)."""
     if not text:
         return ""
-    # En modo Markdown legacy, los problemáticos son: _ * ` [
-    return str(text).replace("_", "\\_").replace("*", "\\*").replace("`", "\\`").replace("[", "\\[")
+    return (str(text)
+            .replace("_", "\\_")
+            .replace("*", "\\*")
+            .replace("`", "\\`")
+            .replace("[", "\\["))
 
 
 def format_match_list(matches, title="HOY"):
     if not matches:
         return (
-            f"⏰ *No hay partidos disponibles {title.lower()}.*\n\n"
-            "_Revisa más tarde o verifica tu ODDS\\_API\\_KEY._"
+            f"⏰ No hay partidos disponibles {title.lower()}.\n\n"
+            "Revisa más tarde o verifica tu ODDS_API_KEY."
         )
     emoji = "🌅" if title == "MAÑANA" else "⚽"
-    lines = [f"{emoji} *PARTIDOS {title}* 🇨🇺\n"]
+    lines = [f"{emoji} PARTIDOS {title} 🇨🇺\n"]
     for i, m in enumerate(matches, 1):
-        home     = _esc(m.get("homeTeam", {}).get("shortName") or m.get("homeTeam", {}).get("name", "?"))
-        away     = _esc(m.get("awayTeam", {}).get("shortName") or m.get("awayTeam", {}).get("name", "?"))
-        comp     = _esc(m.get("competition", {}).get("name") or "")
+        raw_home = m.get("homeTeam", {}).get("shortName") or m.get("homeTeam", {}).get("name", "?")
+        raw_away = m.get("awayTeam", {}).get("shortName") or m.get("awayTeam", {}).get("name", "?")
+        raw_comp = m.get("competition", {}).get("name") or ""
+        home     = _esc(raw_home)
+        away     = _esc(raw_away)
+        comp     = _esc(raw_comp)
         time_cuba = utc_to_cuba(m.get("utcDate", ""))
         status   = m.get("status", "")
         done     = "✅ " if m.get("id") in analyzed_matches else ""
@@ -101,8 +107,8 @@ def format_match_list(matches, title="HOY"):
         lines.append(f"`{i:2d}.` {done}*{home}* vs *{away}*")
         lines.append(f"    🏆 {comp} | {status_icon}")
         lines.append("")
-    cmd = "/pick" if title == "HOY" else "/pick\\_manana"
-    lines.append(f"_{cmd} \\<número\\> para analizar un partido_")
+    cmd_hint = "/pick" if title == "HOY" else "/pick\\_manana"
+    lines.append(f"_{cmd_hint} <número> para analizar_")
     return "\n".join(lines)
 
 
