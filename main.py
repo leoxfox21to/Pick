@@ -21,13 +21,13 @@ from odds_api import (get_all_odds, find_odds_for_match,
                       get_todays_events, get_tomorrows_events,
                       get_odds_for_match_on_demand, get_odds_by_event_id,
                       get_scores_for_sport, get_team_form_from_scores)
-from odds_tracker import save_odds_snapshot, get_odds_movement
 from analyzer import (extract_team_stats, poisson_prediction, h2h_stats,
                       calculate_value_bet, calculate_streak, days_since_last_match,
                       calculate_confidence_score, halftime_stats, day_of_week_stats,
                       night_vs_day_stats, post_cup_fatigue, half_season_stats,
                       get_xg_from_matches, odds_range_performance,
-                      MIN_MATCHES_POISSON)
+                      MIN_MATCHES_POISSON, market_vs_model_conflict,
+                      kelly_criterion, get_league_efficiency_label)
 from injuries_api import get_team_injuries, format_injuries
 from ai_pick import generate_pick
 from apifootball import (get_full_match_data as apifb_get_full_match_data,
@@ -41,7 +41,8 @@ from db import (init_db, save_pick, get_history, get_stats as db_get_stats,
                 subscribe, unsubscribe, is_subscribed, get_active_subscribers,
                 mark_alert_sent, alert_already_sent,
                 save_match_to_cache, get_team_matches_from_cache,
-                get_stats_by_league)
+                get_stats_by_league, get_calibration_stats, save_closing_odds)
+from odds_tracker import save_odds_snapshot, get_odds_movement, get_closing_odds, calculate_clv, get_clv_label
 from data_aggregator import get_extended_match_data
 from referee import get_match_referee, get_referee_stats, format_referee_for_telegram
 from suspensions import get_suspension_risks, format_suspensions
@@ -423,7 +424,8 @@ async def _cmd_pick_from_cache(update: Update, context: ContextTypes.DEFAULT_TYP
         ai_away_stats = {} if (stats_limited and not has_scores_stats) else away_stats
 
         confidence_score = calculate_confidence_score(
-            ai_home_stats, ai_away_stats, poisson_data, h2h, odds, home_stand, away_stand
+            ai_home_stats, ai_away_stats, poisson_data, h2h, odds, home_stand, away_stand,
+            league_key=sport_key
         )
 
         status_note = stats_source_note if stats_limited else f"✅ Confianza: {confidence_score.get('confidence',0)}%"
@@ -458,16 +460,22 @@ async def _cmd_pick_from_cache(update: Update, context: ContextTypes.DEFAULT_TYP
             home_odds_range, away_odds_range,
             ref_info, ref_stats,
             home_susp, away_susp,
+            league_key=sport_key,
         )
 
         parsed = parse_ai_pick(ai_result, home_name, away_name)
-        save_pick(
+        pick_id = save_pick(
             home_team=home_name, away_team=away_name, competition=competition,
             pick_main=parsed.get("pick_main"), pick_secondary=parsed.get("pick_secondary"),
             confidence=parsed.get("confidence"), odds_recommended=parsed.get("odds_recommended"),
             home_odds=odds.get("home_win"), draw_odds=odds.get("draw"), away_odds=odds.get("away_win"),
             sport_key=sport_key, odds_event_id=odds_event_id, match_date=match.get("utcDate", "")[:10],
         )
+        # Guardar CLV inicial si tenemos odds_event_id (para comparar al cierre)
+        if pick_id and odds_event_id:
+            closing = get_closing_odds(odds_event_id)
+            if closing and closing.get("home_win"):
+                save_closing_odds(pick_id, closing.get("home_win"), closing.get("draw"), closing.get("away_win"))
 
         # ── Strings para el mensaje ──────────────────────────────────
         value_home = calculate_value_bet(poisson_data["prob_home_win"], odds.get("home_win"))
@@ -582,12 +590,15 @@ async def _cmd_pick_from_cache(update: Update, context: ContextTypes.DEFAULT_TYP
                 f"  {home_name} {h2h.get('home_wins',0)} | X {h2h.get('draws',0)} | {away_name} {h2h.get('away_wins',0)}"
             )
 
+        def _o(val):
+            return str(round(float(val), 2)) if val is not None else "-"
+
         odds_str = ""
         if odds.get("home_win"):
             odds_str = (
                 f"\n💰 *Cuotas:*\n"
-                f"  1: {odds.get('home_win','-')} | X: {odds.get('draw','-')} | 2: {odds.get('away_win','-')}\n"
-                f"  Over 2.5: {odds.get('over_25','-')} | BTTS: {odds.get('btts_yes','-')}"
+                f"  1: {_o(odds.get('home_win'))} | X: {_o(odds.get('draw'))} | 2: {_o(odds.get('away_win'))}\n"
+                f"  Over 2.5: {_o(odds.get('over_25'))} | BTTS: {_o(odds.get('btts_yes'))}"
             )
 
         movement_str = ""
@@ -608,6 +619,34 @@ async def _cmd_pick_from_cache(update: Update, context: ContextTypes.DEFAULT_TYP
         if (best_value[1] and best_value[1] >= 7.0
                 and _prob_thresholds.get(best_value[0], 0) >= 25):
             value_str = f"\n💎 *Valor detectado:* {best_value[0]} (+{best_value[1]:.1f}% EV)"
+
+        # Kelly Criterion
+        kelly_str = ""
+        kelly_h = kelly_criterion(poisson_data.get("prob_home_win", 0), odds.get("home_win"))
+        kelly_d = kelly_criterion(poisson_data.get("prob_draw", 0),     odds.get("draw"))
+        kelly_a = kelly_criterion(poisson_data.get("prob_away_win", 0), odds.get("away_win"))
+        k_parts = []
+        if kelly_h: k_parts.append(f"{home_name}: {kelly_h}% bankroll")
+        if kelly_d: k_parts.append(f"Empate: {kelly_d}% bankroll")
+        if kelly_a: k_parts.append(f"{away_name}: {kelly_a}% bankroll")
+        if k_parts:
+            kelly_str = "\n💸 *Kelly (tamaño apuesta):* " + " | ".join(k_parts)
+
+        # Conflicto mercado vs modelo
+        conflict_str = ""
+        conflicts = market_vs_model_conflict(poisson_data, odds, sport_key)
+        if conflicts:
+            c_lines = []
+            for c in conflicts:
+                c_lines.append(
+                    f"  {c['severity']} {c['outcome']}: modelo {c['model']}% vs mercado {c['market']}% "
+                    f"(Δ{c['diff']}%) → confiar en {c['trust']}"
+                )
+            conflict_str = "\n🔀 *Modelo vs Mercado:*\n" + "\n".join(c_lines)
+
+        # Eficiencia del mercado
+        eff_label = get_league_efficiency_label(sport_key)
+        efficiency_str = f"\n📡 *{eff_label}*" if sport_key else ""
 
         injuries_str = format_injuries(home_injuries, home_name) + format_injuries(away_injuries, away_name)
         weather_str  = format_weather(weather_data)
@@ -670,6 +709,9 @@ async def _cmd_pick_from_cache(update: Update, context: ContextTypes.DEFAULT_TYP
             f"{h2h_str}"
             f"{odds_str}"
             f"{movement_str}"
+            f"{efficiency_str}"
+            f"{conflict_str}"
+            f"{kelly_str}"
             f"{value_str}\n\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🤖 *ANÁLISIS IA:*\n"
@@ -725,10 +767,17 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not stats or stats.get("total", 0) == 0:
         await update.message.reply_text("📈 *Estadísticas*\n\n_Aún no hay picks guardados._", parse_mode="Markdown")
         return
-    acc     = stats.get("accuracy", 0)
-    hc_acc  = stats.get("hc_accuracy", 0)
+    acc      = stats.get("accuracy", 0)
+    hc_acc   = stats.get("hc_accuracy", 0)
+    clv_avg  = stats.get("clv_avg")
     acc_icon = "🔥" if acc >= 65 else "📊" if acc >= 50 else "📉"
     hc_icon  = "🔥" if hc_acc >= 70 else "📊" if hc_acc >= 55 else "📉"
+
+    clv_line = ""
+    if clv_avg is not None:
+        clv_icon = "📈" if clv_avg > 1 else "➡️" if clv_avg >= -1 else "⚠️"
+        clv_line = f"\n{clv_icon} *CLV promedio: {clv_avg:+.2f}%* ({'picks inteligentes' if clv_avg > 0 else 'mejorar selección'})"
+
     text = (
         f"📈 *ESTADÍSTICAS DE PICKS*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -738,9 +787,32 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"⏳ Pendientes: {stats['pending']}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"{acc_icon} *Acierto general: {acc}%*\n"
-        f"{hc_icon} *Alta confianza (≥70%): {hc_acc}%* ({stats['hc_correct']}/{stats['hc_total']})\n"
+        f"{hc_icon} *Alta confianza (≥70%): {hc_acc}%* ({stats['hc_correct']}/{stats['hc_total']})"
+        f"{clv_line}\n"
         f"━━━━━━━━━━━━━━━━━━━━"
     )
+
+    # Calibración de confianza
+    calib = get_calibration_stats()
+    if calib:
+        calib_lines = ["\n\n🎯 *CALIBRACIÓN (confianza declarada vs acierto real):*"]
+        for row in calib:
+            bucket   = row.get("bucket", "?")
+            real_acc = row.get("real_accuracy")
+            total_b  = row.get("total", 0)
+            correct_b = row.get("correct", 0)
+            if real_acc is None:
+                continue
+            bucket_mid = int(bucket.split("-")[0].replace("%+", "").replace("%", ""))
+            diff = real_acc - bucket_mid
+            cal_icon = "✅" if abs(diff) <= 8 else ("📈" if diff > 0 else "📉")
+            calib_lines.append(
+                f"  {cal_icon} {bucket}: declaré ~{bucket_mid}% → acerté *{real_acc}%* ({correct_b}/{total_b})"
+            )
+        if len(calib_lines) > 1:
+            calib_lines.append("_✅=bien calibrado | 📈=subestimado | 📉=sobreconfiado_")
+            text += "\n".join(calib_lines)
+
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
