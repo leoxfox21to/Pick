@@ -623,7 +623,7 @@ def get_fixture_lineups(fixture_id: int) -> dict:
                 tname = td.get("team", {}).get("name", "")
                 result[tname] = {
                     "formation": td.get("formation", ""),
-                    "coach":     td.get("coach", {}).get("name", ""),
+                    "coach":     {"name": td.get("coach", {}).get("name", "")} if td.get("coach", {}).get("name") else {},
                     "starters":  [p.get("player", {}).get("name", "") for p in td.get("startXI", [])],
                 }
             if result:
