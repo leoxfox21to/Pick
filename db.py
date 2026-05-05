@@ -37,9 +37,20 @@ def init_db():
                 result_home INTEGER,
                 result_away INTEGER,
                 pick_correct INTEGER,
-                checked_at TEXT
+                checked_at TEXT,
+                closing_home_odds REAL,
+                closing_draw_odds REAL,
+                closing_away_odds REAL,
+                clv REAL
             )
         """)
+        # Agregar columnas CLV si la tabla ya existía sin ellas
+        for col in ["closing_home_odds REAL", "closing_draw_odds REAL", "closing_away_odds REAL", "clv REAL"]:
+            try:
+                conn.execute(f"ALTER TABLE picks ADD COLUMN {col}")
+            except Exception:
+                pass
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS subscribers (
                 chat_id INTEGER PRIMARY KEY,
@@ -160,6 +171,54 @@ def save_pick(home_team, away_team, competition, pick_main, pick_secondary,
         return None
 
 
+def save_closing_odds(pick_id, closing_home, closing_draw, closing_away):
+    """Guarda las cuotas de cierre (justo antes del partido) y calcula el CLV.
+    CLV positivo = el pick fue bueno (las cuotas cerraron peor para nosotros = el mercado nos dio la razón).
+    CLV negativo = el pick fue malo (el mercado se movió en contra)."""
+    if not pick_id:
+        return
+    try:
+        with get_conn() as conn:
+            row = conn.execute(
+                "SELECT home_odds, draw_odds, away_odds, pick_main, home_team, away_team FROM picks WHERE id = ?",
+                (pick_id,)
+            ).fetchone()
+            if not row:
+                return
+
+            clv = None
+            pick_lower = (row["pick_main"] or "").lower()
+            open_odds = None
+            close_odds = None
+
+            if name_matches(row["home_team"], pick_lower) or "local" in pick_lower:
+                open_odds  = row["home_odds"]
+                close_odds = closing_home
+            elif name_matches(row["away_team"], pick_lower) or "visitante" in pick_lower:
+                open_odds  = row["away_odds"]
+                close_odds = closing_away
+            elif "empate" in pick_lower or "draw" in pick_lower:
+                open_odds  = row["draw_odds"]
+                close_odds = closing_draw
+
+            if open_odds and close_odds and open_odds > 1.0 and close_odds > 1.0:
+                # CLV = diferencia en valor esperado entre cuota de apertura y cierre
+                clv = round((1 / close_odds - 1 / open_odds) * 100, 2)
+
+            conn.execute("""
+                UPDATE picks SET
+                    closing_home_odds = ?,
+                    closing_draw_odds = ?,
+                    closing_away_odds = ?,
+                    clv = ?
+                WHERE id = ?
+            """, (closing_home, closing_draw, closing_away, clv, pick_id))
+            conn.commit()
+            logger.info(f"CLV guardado para pick {pick_id}: {clv}")
+    except Exception as e:
+        logger.error(f"Error guardando closing odds: {e}")
+
+
 def get_pending_picks():
     try:
         with get_conn() as conn:
@@ -225,6 +284,10 @@ def get_stats():
                 "SELECT COUNT(*) FROM picks WHERE confidence >= 70 AND pick_correct = 1"
             ).fetchone()[0]
 
+            clv_avg = conn.execute(
+                "SELECT AVG(clv) FROM picks WHERE clv IS NOT NULL"
+            ).fetchone()[0]
+
             return {
                 "total": total,
                 "resolved": resolved,
@@ -235,18 +298,44 @@ def get_stats():
                 "hc_total": hc_total,
                 "hc_correct": hc_correct,
                 "hc_accuracy": round(hc_correct / hc_total * 100, 1) if hc_total > 0 else 0,
+                "clv_avg": round(clv_avg, 2) if clv_avg is not None else None,
             }
     except Exception as e:
         logger.error(f"Error obteniendo stats: {e}")
         return {}
 
 
+def get_calibration_stats():
+    """Compara la confianza declarada del bot con el acierto real.
+    Si el bot dice 80% de confianza, ¿gana realmente el 80% de las veces?
+    Devuelve buckets: [(rango_conf, picks_totales, aciertos, acierto_real%), ...]"""
+    try:
+        with get_conn() as conn:
+            rows = conn.execute("""
+                SELECT
+                    CASE
+                        WHEN confidence < 60 THEN '50-59%'
+                        WHEN confidence < 70 THEN '60-69%'
+                        WHEN confidence < 80 THEN '70-79%'
+                        WHEN confidence < 90 THEN '80-89%'
+                        ELSE '90%+'
+                    END AS bucket,
+                    COUNT(*) AS total,
+                    SUM(CASE WHEN pick_correct = 1 THEN 1 ELSE 0 END) AS correct,
+                    ROUND(100.0 * SUM(CASE WHEN pick_correct = 1 THEN 1 ELSE 0 END) /
+                        NULLIF(SUM(CASE WHEN pick_correct IS NOT NULL THEN 1 ELSE 0 END), 0), 1) AS real_accuracy
+                FROM picks
+                WHERE confidence IS NOT NULL AND pick_correct IS NOT NULL
+                GROUP BY bucket
+                ORDER BY bucket
+            """).fetchall()
+            return [dict(r) for r in rows]
+    except Exception as e:
+        logger.error(f"Error obteniendo calibración: {e}")
+        return []
+
+
 def get_stats_by_league(min_picks: int = 3) -> list:
-    """
-    Devuelve estadísticas de aciertos agrupadas por liga (sport_key).
-    Solo incluye ligas con al menos `min_picks` picks resueltos.
-    Ordenadas de mayor a menor acierto.
-    """
     try:
         with get_conn() as conn:
             rows = conn.execute("""
