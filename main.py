@@ -1090,10 +1090,15 @@ async def cmd_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── The Odds API ──────────────────────────────────────────────────
     lines.append("🎲 <b>The Odds API</b>")
-    if odds.get("ok"):
-        lines.append(f"  ✅ Activa | Usadas: {odds.get('used','?')} | Restantes: {odds.get('remaining','?')}")
+    if not odds.get("ok") and odds.get("keys", 0) == 0:
+        lines.append(f"  ❌ {odds.get('error', 'Sin clave configurada')}")
     else:
-        lines.append(f"  ❌ Error: {odds.get('error','?')}")
+        lines.append(f"  🔑 {odds.get('keys', 0)} clave(s)")
+        for d in odds.get("details", []):
+            if d.get("ok"):
+                lines.append(f"  ✅ Key {d['key_num']}: Usadas: {d.get('used','?')} | Restantes: {d.get('remaining','?')}{d.get('bar','')}")
+            else:
+                lines.append(f"  ❌ Key {d['key_num']}: {d.get('error','?')}")
     lines.append("")
 
     # ── football-data.org ─────────────────────────────────────────────
