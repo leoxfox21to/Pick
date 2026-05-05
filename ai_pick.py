@@ -144,7 +144,7 @@ def generate_pick(
         return f"{name}: {days} días (descansado)"
 
     def coach_str(name, coach):
-        if not coach or not coach.get("name"):
+        if not coach or not isinstance(coach, dict) or not coach.get("name"):
             return f"{name}: Sin datos de entrenador"
         since = f" (desde {coach['start']})" if coach.get("start") else ""
         return f"{name}: {coach['name']}{since} | {coach.get('nationality','')} | {coach.get('age','?')} años"
