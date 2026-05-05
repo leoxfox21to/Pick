@@ -471,6 +471,52 @@ def get_cache_team_count(team_name: str) -> int:
         return 0
 
 
+
+
+def get_cache_stats() -> dict:
+    """
+    Devuelve estadísticas del cache local de partidos (match_history).
+    Retorna total de partidos, desglose por liga y por fuente.
+    """
+    try:
+        with get_conn() as conn:
+            total = conn.execute("SELECT COUNT(*) FROM match_history").fetchone()[0]
+
+            by_league = conn.execute("""
+                SELECT competition, COUNT(*) as total
+                FROM match_history
+                WHERE competition IS NOT NULL AND competition != ''
+                GROUP BY competition
+                ORDER BY total DESC
+                LIMIT 30
+            """).fetchall()
+
+            by_source = conn.execute("""
+                SELECT source, COUNT(*) as total
+                FROM match_history
+                GROUP BY source
+                ORDER BY total DESC
+            """).fetchall()
+
+            oldest = conn.execute(
+                "SELECT MIN(match_date) FROM match_history WHERE match_date IS NOT NULL"
+            ).fetchone()[0]
+
+            newest = conn.execute(
+                "SELECT MAX(match_date) FROM match_history WHERE match_date IS NOT NULL"
+            ).fetchone()[0]
+
+        return {
+            "total": total,
+            "by_league": [{"competition": r[0], "total": r[1]} for r in by_league],
+            "by_source": [{"source": r[0], "total": r[1]} for r in by_source],
+            "oldest": oldest,
+            "newest": newest,
+        }
+    except Exception as e:
+        logger.error(f"Error get_cache_stats: {e}")
+        return {"total": 0, "by_league": [], "by_source": [], "oldest": None, "newest": None}
+
 def name_matches(a, b):
     a = a.lower().strip()
     b = b.lower().strip()
