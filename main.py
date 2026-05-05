@@ -176,14 +176,13 @@ async def _load_matches_day(update: Update, context: ContextTypes.DEFAULT_TYPE,
                 for m in lst
             )
 
-        # API-Football es la base — filtramos solo SCHEDULED e IN_PLAY (no FINISHED)
+        # API-Football es la fuente principal — filtramos solo partidos no terminados
         matches = [
             fx for fx in _apifb_fx
             if fx.get("status") in ("SCHEDULED", "IN_PLAY", "PAUSED", "TIMED")
         ]
 
         # Anotar cada partido de API-Football con el _event_id de Odds API
-        # (necesario para obtener cuotas en /pick)
         for m in matches:
             mh = m.get("homeTeam", {}).get("name", "")
             ma = m.get("awayTeam", {}).get("name", "")
@@ -197,9 +196,22 @@ async def _load_matches_day(update: Update, context: ContextTypes.DEFAULT_TYPE,
                         m["_sport_key"] = ev.get("_sport_key")
                     break
 
+        # ── FALLBACK: si API-Football devuelve vacío, usar Odds API como fuente ──
+        if not matches and odds_events:
+            logger.warning(
+                f"API-Football devolvió 0 partidos para {_tgt_date}. "
+                f"Usando {len(odds_events)} eventos de Odds API como fallback."
+            )
+            for ev in odds_events:
+                ev["_source"] = ev.get("_source", "odds_api")
+            matches = odds_events
+            source_label = "Odds API"
+        else:
+            source_label = "API-Football"
+
         logger.info(
-            f"Partidos {_tgt_date}: {len(_apifb_fx)} API-Football "
-            f"mostrando {len(matches)} partidos programados (solo API-Football)."
+            f"Partidos {_tgt_date}: fuente={source_label} | "
+            f"API-Football={len(_apifb_fx)} | mostrando {len(matches)} partidos."
         )
 
         def _cuba_sort_key(m):
