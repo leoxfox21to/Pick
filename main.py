@@ -46,6 +46,7 @@ from db import (init_db, save_pick, get_history, get_stats as db_get_stats,
                 get_balance, get_bankroll_summary, get_bankroll_history,
                 get_today_total_staked, get_rendimiento_stats)
 from odds_tracker import save_odds_snapshot, get_odds_movement, get_closing_odds, calculate_clv, get_clv_label
+from api_status import check_odds_api, check_football_data, check_apifootball, check_groq
 from data_aggregator import get_extended_match_data
 from referee import get_match_referee, get_referee_stats, format_referee_for_telegram
 from suspensions import get_suspension_risks, format_suspensions
@@ -1075,6 +1076,77 @@ async def post_init(app):
     logger.info("Loops de resultados, alertas, movimiento de línea y bankroll iniciados.")
 
 
+async def cmd_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = await update.message.reply_text("🔄 Verificando APIs...")
+
+    odds, fd, apifb, groq = await asyncio.gather(
+        asyncio.to_thread(check_odds_api),
+        asyncio.to_thread(check_football_data),
+        asyncio.to_thread(check_apifootball),
+        asyncio.to_thread(check_groq),
+    )
+
+    lines = ["📡 <b>ESTADO DE APIs</b>\n"]
+
+    # ── The Odds API ──────────────────────────────────────────────────
+    lines.append("🎲 <b>The Odds API</b>")
+    if odds.get("ok"):
+        lines.append(f"  ✅ Activa | Usadas: {odds.get('used','?')} | Restantes: {odds.get('remaining','?')}")
+    else:
+        lines.append(f"  ❌ Error: {odds.get('error','?')}")
+    lines.append("")
+
+    # ── football-data.org ─────────────────────────────────────────────
+    lines.append("⚽ <b>football-data.org</b>")
+    if not fd.get("ok") and fd.get("keys", 0) == 0:
+        lines.append("  ❌ Sin clave configurada")
+    else:
+        lines.append(f"  🔑 {fd.get('keys', 0)} clave(s)")
+        for d in fd.get("details", []):
+            if d.get("ok"):
+                lines.append(
+                    f"  ✅ Key {d['key_num']}: {d.get('available_minute','?')} req/min disponibles"
+                )
+            else:
+                lines.append(f"  ❌ Key {d['key_num']}: {d.get('error','?')}")
+    lines.append("")
+
+    # ── API-Football ──────────────────────────────────────────────────
+    lines.append("🏟️ <b>API-Football (api-sports.io)</b>")
+    if not apifb.get("ok") and apifb.get("keys", 0) == 0:
+        lines.append("  ❌ Sin clave configurada")
+    else:
+        lines.append(f"  🔑 {apifb.get('keys', 0)} clave(s)")
+        for d in apifb.get("details", []):
+            if d.get("ok"):
+                remaining = d.get("remaining", "?")
+                bar = ""
+                if isinstance(remaining, int) and isinstance(d.get("limit"), int):
+                    pct = remaining / d["limit"]
+                    bar = " 🟢" if pct > 0.3 else " 🟡" if pct > 0.1 else " 🔴"
+                lines.append(
+                    f"  ✅ Key {d['key_num']}: {d.get('used','?')}/{d.get('limit','?')} usadas | "
+                    f"Restantes: {remaining}{bar}"
+                )
+            else:
+                lines.append(f"  ❌ Key {d['key_num']}: {d.get('error','?')}")
+    lines.append("")
+
+    # ── Groq ──────────────────────────────────────────────────────────
+    lines.append("🤖 <b>Groq (IA / LLaMA)</b>")
+    if not groq.get("ok") and groq.get("keys", 0) == 0:
+        lines.append("  ❌ Sin clave configurada")
+    else:
+        lines.append(f"  🔑 {groq.get('keys', 0)} clave(s)")
+        for d in groq.get("details", []):
+            if d.get("ok"):
+                lines.append(f"  ✅ Key {d['key_num']}: Activa")
+            else:
+                lines.append(f"  ❌ Key {d['key_num']}: {d.get('error','?')}")
+
+    await msg.edit_text("\n".join(lines), parse_mode="HTML")
+
+
 def main():
     if not TELEGRAM_TOKEN:
         logger.error("TELEGRAM_BOT_TOKEN no encontrado.")
@@ -1098,6 +1170,7 @@ def main():
     app.add_handler(CommandHandler("combinadas",  cmd_combinadas))
     app.add_handler(CommandHandler("rendimiento", cmd_rendimiento))
     app.add_handler(CommandHandler("bankroll",    cmd_bankroll))
+    app.add_handler(CommandHandler("api",         cmd_api))
     logger.info("Bot iniciado con todos los módulos activos.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
