@@ -103,3 +103,47 @@ def get_odds_movement(match_id, current_odds):
         result["alert_msg"] = " | ".join(alerts)
 
     return result if result["movements"] else None
+
+
+def get_closing_odds(match_id):
+    """Obtiene la última snapshot de cuotas guardada para un partido (cuota de cierre).
+    Útil para calcular el CLV después del partido."""
+    cache = _load_cache()
+    key = str(match_id)
+    entry = cache.get(key)
+    if not entry or not entry.get("snapshots"):
+        return None
+    last = entry["snapshots"][-1]
+    return {
+        "home_win": last.get("home_win"),
+        "draw":     last.get("draw"),
+        "away_win": last.get("away_win"),
+        "time":     last.get("time"),
+    }
+
+
+def calculate_clv(open_odds, close_odds):
+    """Calcula el Closing Line Value (CLV).
+    CLV positivo = apostamos antes de que el mercado cerrara peor = pick inteligente.
+    CLV negativo = el mercado mejoró después de nuestra apuesta = pick cuestionable.
+    Retorna el CLV en % de valor esperado ganado/perdido."""
+    if not open_odds or not close_odds or open_odds <= 1.0 or close_odds <= 1.0:
+        return None
+    # CLV = diferencia en probabilidad implícita
+    # Si la cuota bajó (mercado más seguro), nosotros conseguimos mejor precio = CLV positivo
+    clv = round((1 / close_odds - 1 / open_odds) * 100, 2)
+    return clv
+
+
+def get_clv_label(clv):
+    """Etiqueta legible para el CLV."""
+    if clv is None:
+        return "Sin datos CLV"
+    if clv > 3:
+        return f"📈 CLV muy positivo (+{clv}%) — pick de alta calidad"
+    elif clv > 0:
+        return f"✅ CLV positivo (+{clv}%) — pick inteligente"
+    elif clv >= -2:
+        return f"➡️ CLV neutro ({clv}%) — pick aceptable"
+    else:
+        return f"⚠️ CLV negativo ({clv}%) — el mercado no avaló este pick"
