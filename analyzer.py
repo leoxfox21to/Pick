@@ -826,3 +826,36 @@ def h2h_stats(h2h_matches, home_id, away_id):
     if total == 0:
         return {}
     return {"total": total, "home_wins": home_wins, "draws": draws, "away_wins": away_wins}
+
+
+def get_xg_proxy_from_stats(team_stats: dict, league_key: str = None) -> dict:
+    """xG proxy cuando no hay datos Sofascore.
+    Usa goles reales suavizados hacia la media de liga como estimación de calidad de ocasiones.
+    Se marca como proxy para que la IA lo interprete correctamente."""
+    if not team_stats or team_stats.get("total_matches", 0) < 5:
+        return {}
+    avg_scored   = team_stats.get("avg_scored", 0)
+    avg_conceded = team_stats.get("avg_conceded", 0)
+    if avg_scored == 0 and avg_conceded == 0:
+        return {}
+    league_avg = LEAGUE_AVG_GOALS.get(league_key, DEFAULT_LEAGUE_AVG) if league_key else DEFAULT_LEAGUE_AVG
+    n          = team_stats.get("total_matches", 10)
+    smooth     = min(5.0 / n, 0.30)
+    xg_scored   = round(avg_scored   * (1 - smooth) + league_avg * smooth, 2)
+    xg_conceded = round(avg_conceded * (1 - smooth) + league_avg * smooth, 2)
+    xg_diff     = round(xg_scored - xg_conceded, 2)
+    over_performer = None
+    diff = round(avg_scored - xg_scored, 2)
+    if diff > 0.25:
+        over_performer = f"Marcando MÁS de lo esperado (+{diff} sobre xG proxy) → posible regresión"
+    elif diff < -0.25:
+        over_performer = f"Marcando MENOS de lo esperado ({diff} vs xG proxy) → podría mejorar"
+    return {
+        "avg_xg_scored":   xg_scored,
+        "avg_xg_conceded": xg_conceded,
+        "avg_goals":       round(avg_scored, 2),
+        "xg_diff":         xg_diff,
+        "sample_size":     n,
+        "over_performer":  over_performer,
+        "is_proxy":        True,
+    }
