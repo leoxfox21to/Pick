@@ -1,8 +1,10 @@
-import requests
-import logging
+"""
+Módulo SofaScore — acceso sin API key.
+Provee historial de partidos y H2H para equipos no cubiertos por football-data.org.
+"""
 import time
-import unicodedata
-import re
+import logging
+import requests
 from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
@@ -12,12 +14,10 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Referer": "https://www.sofascore.com/",
     "Accept": "application/json",
-    "Accept-Language": "en-US,en;q=0.9",
 }
 
-_cache = {}
-CACHE_TTL      = 3600
-CACHE_TTL_TEAM = 86400
+_cache     = {}
+CACHE_TTL  = 3600 * 6
 
 
 def _get(url, params=None, timeout=10):
@@ -27,24 +27,18 @@ def _get(url, params=None, timeout=10):
             return resp.json()
         logger.debug(f"SofaScore HTTP {resp.status_code}: {url}")
     except Exception as e:
-        logger.debug(f"SofaScore request error {url}: {e}")
+        logger.debug(f"SofaScore error: {e}")
     return None
 
 
 def _normalize(name: str) -> str:
-    """Normaliza nombre: sin tildes, minúsculas, sin palabras genéricas."""
+    import unicodedata, re
     name = unicodedata.normalize("NFD", name)
     name = "".join(c for c in name if unicodedata.category(c) != "Mn")
     name = name.lower()
-    name = re.sub(
-        r"\b(fc|cf|sc|ac|afc|bsc|fk|sk|club|de|del|the|united|city|athletic|atletico|"
-        r"real|sporting|deportivo|hyundai|motors|hotspur|association|football|soccer|"
-        r"calcio|futbol|sport|esporte|espor)\b",
-        "", name
-    )
+    name = re.sub(r"\b(fc|cf|sc|ac|afc|fk|sk|club|de|del|the|real|atletico|sporting|deportivo)\b", "", name)
     name = re.sub(r"[^a-z0-9 ]", " ", name)
-    name = re.sub(r"\s+", " ", name).strip()
-    return name
+    return re.sub(r"\s+", " ", name).strip()
 
 
 def _sig_words(name: str) -> set:
@@ -52,12 +46,13 @@ def _sig_words(name: str) -> set:
 
 
 def _team_score(query: str, candidate: str) -> float:
-    """Score de similitud entre 0.0 y 1.0."""
-    qn = _normalize(query)
-    cn = _normalize(candidate)
-    if qn == cn:
+    if not query or not candidate:
+        return 0.0
+    nq = _normalize(query)
+    nc = _normalize(candidate)
+    if nq == nc:
         return 1.0
-    if qn in cn or cn in qn:
+    if nq in nc or nc in nq:
         return 0.9
     qw = _sig_words(query)
     cw = _sig_words(candidate)
@@ -70,61 +65,51 @@ def _team_score(query: str, candidate: str) -> float:
 
 
 def _generate_query_variants(name: str) -> list:
-    """Genera variantes del nombre para buscar (completo, primera palabra, sin sufijos)."""
     variants = [name]
-    words = name.split()
-    if len(words) >= 2:
-        variants.append(words[0])
-    if len(words) >= 3:
-        variants.append(" ".join(words[:2]))
-    clean = re.sub(
-        r"\b(FC|CF|SC|AC|AFC|BSC|FK|SK|Club|United|City|Athletic|Atletico|Real|Sporting|"
-        r"Hyundai|Motors|Hotspur|Deportivo|Calcio)\b",
-        "", name, flags=re.IGNORECASE
-    ).strip()
-    if clean and clean != name and clean not in variants:
-        variants.append(clean)
-    return variants
+    for token in ["FC", "CF", "SC", "AC", "United", "City", "Athletic"]:
+        if token.lower() not in name.lower():
+            variants.append(f"{name} {token}")
+        stripped = name.replace(token, "").strip()
+        if stripped and stripped != name:
+            variants.append(stripped)
+    return list(dict.fromkeys(variants))[:4]
 
 
 def search_team(name: str) -> int | None:
-    """Busca un equipo en SofaScore probando múltiples variantes del nombre."""
-    cache_key = f"team_{name.lower().strip()}"
+    cache_key = f"search_{name.lower()}"
     c = _cache.get(cache_key)
-    if c and time.time() - c["ts"] < CACHE_TTL_TEAM:
+    if c and time.time() - c["ts"] < CACHE_TTL:
         return c["v"]
 
-    variants  = _generate_query_variants(name)
-    best_id   = None
+    best_id    = None
     best_score = 0.0
-    MIN_SCORE = 0.45
 
-    for query in variants:
-        data = _get(f"{BASE_URL}/search/all", params={"q": query, "sport": "football"})
+    for variant in _generate_query_variants(name):
+        data = _get(f"{BASE_URL}/search/multi-search/{variant}")
         if not data:
             continue
         for r in data.get("results", []):
+            if not isinstance(r, dict):
+                continue
             if r.get("type") != "team":
                 continue
             entity    = r.get("entity", {})
+            if not isinstance(entity, dict):
+                continue
             candidate = entity.get("name", "")
-            score     = _team_score(name, candidate)
             short     = entity.get("shortName", "")
-            if short:
-                score = max(score, _team_score(name, short))
+            score = max(_team_score(name, candidate), _team_score(name, short))
             if score > best_score:
                 best_score = score
                 best_id    = entity.get("id")
-        if best_score >= 0.9:
-            break
 
-    if best_id and best_score >= MIN_SCORE:
-        _cache[cache_key] = {"v": best_id, "ts": time.time()}
-        logger.info(f"SofaScore team '{name}' → ID {best_id} (score={best_score:.2f})")
-        return best_id
+    if best_score >= 0.5:
+        logger.info(f"SofaScore team '{name}' → id={best_id} (score={best_score:.2f})")
+    else:
+        best_id = None
 
-    logger.debug(f"SofaScore: no encontró equipo '{name}' (mejor score={best_score:.2f})")
-    return None
+    _cache[cache_key] = {"v": best_id, "ts": time.time()}
+    return best_id
 
 
 def get_team_events(team_id: int, page: int = 0) -> list:
@@ -133,10 +118,14 @@ def get_team_events(team_id: int, page: int = 0) -> list:
     if c and time.time() - c["ts"] < CACHE_TTL:
         return c["v"]
     data   = _get(f"{BASE_URL}/team/{team_id}/events/last/{page}")
-    events = (data or {}).get("events", [])
-    if events:
-        _cache[key] = {"v": events, "ts": time.time()}
+    events = (data or {}).get("events", []) if isinstance(data, dict) else []
+    _cache[key] = {"v": events, "ts": time.time()}
     return events
+
+
+def _safe_dict(obj) -> dict:
+    """Devuelve obj si es dict, si no devuelve {}."""
+    return obj if isinstance(obj, dict) else {}
 
 
 def _convert_event(ev) -> dict:
@@ -144,21 +133,27 @@ def _convert_event(ev) -> dict:
     Convierte un evento SofaScore al formato estándar del bot.
     Incluye xG (homeScore.expected / awayScore.expected) cuando disponible.
     """
-    home = ev.get("homeTeam", {})
-    away = ev.get("awayTeam", {})
-    hs   = ev.get("homeScore", {})
-    as_  = ev.get("awayScore", {})
+    if not isinstance(ev, dict):
+        return {}
+
+    home = _safe_dict(ev.get("homeTeam", {}))
+    away = _safe_dict(ev.get("awayTeam", {}))
+    hs   = _safe_dict(ev.get("homeScore", {}))
+    as_  = _safe_dict(ev.get("awayScore", {}))
 
     ts = ev.get("startTimestamp")
     date_str = (
         datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         if ts else ""
     )
-    status_type = ev.get("status", {}).get("type", "")
+    status = _safe_dict(ev.get("status", {}))
+    status_type = status.get("type", "") if isinstance(status, dict) else ""
 
-    # xG: SofaScore lo almacena en homeScore.expected / awayScore.expected
     xg_home = hs.get("expected")
     xg_away = as_.get("expected")
+
+    tournament = _safe_dict(ev.get("tournament", {}))
+    unique_t   = _safe_dict(tournament.get("uniqueTournament", {}))
 
     return {
         "id":       ev.get("id"),
@@ -175,13 +170,12 @@ def _convert_event(ev) -> dict:
                 "home": hs.get("period1"),
                 "away": as_.get("period1"),
             },
-            # xG almacenado para uso en get_xg_from_matches()
             "xg_home": xg_home,
             "xg_away": xg_away,
         },
         "competition": {
-            "id":   ev.get("tournament", {}).get("uniqueTournament", {}).get("id"),
-            "name": ev.get("tournament", {}).get("name", ""),
+            "id":   unique_t.get("id"),
+            "name": tournament.get("name", ""),
             "type": "",
         },
         "_source": "sofascore",
@@ -200,11 +194,15 @@ def get_team_matches(team_name: str, last: int = 20) -> tuple[int | None, list]:
         events = get_team_events(team_id, page)
         if not events:
             break
-        finished = [
-            _convert_event(e)
-            for e in events
-            if e.get("status", {}).get("type") == "finished"
-        ]
+        finished = []
+        for e in events:
+            if not isinstance(e, dict):
+                continue
+            status = _safe_dict(e.get("status", {}))
+            if status.get("type") == "finished":
+                converted = _convert_event(e)
+                if converted:
+                    finished.append(converted)
         all_finished.extend(finished)
         if len(all_finished) >= last:
             break
@@ -225,10 +223,17 @@ def get_h2h(team1_id: int, team2_id: int, last: int = 10) -> list:
     events = get_team_events(team1_id, 0)
     h2h    = []
     for ev in events:
-        ht = ev.get("homeTeam", {}).get("id")
-        at = ev.get("awayTeam", {}).get("id")
-        if team2_id in (ht, at) and ev.get("status", {}).get("type") == "finished":
-            h2h.append(_convert_event(ev))
+        if not isinstance(ev, dict):
+            continue
+        home_team = _safe_dict(ev.get("homeTeam", {}))
+        away_team = _safe_dict(ev.get("awayTeam", {}))
+        ht = home_team.get("id")
+        at = away_team.get("id")
+        status = _safe_dict(ev.get("status", {}))
+        if team2_id in (ht, at) and status.get("type") == "finished":
+            converted = _convert_event(ev)
+            if converted:
+                h2h.append(converted)
         if len(h2h) >= last:
             break
 
