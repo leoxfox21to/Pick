@@ -17,16 +17,31 @@ def _load_keys():
             keys.append(k)
     return keys
 
-_key_index = 0
+_apifb_daily_usage = {}
+_apifb_reset_date  = None
 
 def _get_headers():
-    global _key_index
+    """Rotacion SECUENCIAL: agota key1 -> key2 -> key3. Limite: 95 req/dia."""
+    global _apifb_daily_usage, _apifb_reset_date
+    from datetime import timezone
+    today = datetime.now(timezone.utc).date().isoformat()
+    if _apifb_reset_date != today:
+        _apifb_daily_usage = {}
+        _apifb_reset_date = today
     keys = _load_keys()
     if not keys:
         return {}
-    key = keys[_key_index % len(keys)]
-    _key_index = (_key_index + 1) % len(keys)
-    return {"x-apisports-key": key}
+    LIMIT = 95
+    for key in keys:
+        kp = key[-8:]
+        used = _apifb_daily_usage.get(kp, 0)
+        if used < LIMIT:
+            _apifb_daily_usage[kp] = used + 1
+            return {"x-apisports-key": key}
+    logger.warning("API-Football: todas las keys agotadas hoy, usando ultima")
+    kp = keys[-1][-8:]
+    _apifb_daily_usage[kp] = _apifb_daily_usage.get(kp, 0) + 1
+    return {"x-apisports-key": keys[-1]}
 
 def _has_key():
     return bool(_load_keys())
@@ -449,3 +464,203 @@ def get_full_match_data(home_name, away_name, sport_key):
             away_stand = get_team_standing(league_id, away_id)
 
     return home_fix, away_fix, h2h_fix, home_stand, away_stand, home_id, away_id
+
+
+# ─── Mapa inverso: league_id → sport_key ────────────────────────────────────
+LEAGUE_ID_TO_SPORT_KEY = {v: k for k, v in SPORT_KEY_TO_LEAGUE.items()}
+
+
+def get_fixtures_by_date(date_str: str) -> list:
+    """
+    Una sola request => todos los partidos del dia en formato estandar del bot.
+    Ideal para ampliar /partidos y /manana con ligas que no cubre Odds API.
+    """
+    if not _has_key():
+        return []
+    cache_key = f"fixtures_date_{date_str}"
+    cached = _fixtures_cache.get(cache_key)
+    if cached and (time.time() - cached["ts"]) < 1800:
+        return cached["data"]
+    try:
+        params = {"date": date_str, "timezone": "America/Havana"}
+        resp = requests.get(f"{BASE_URL}/fixtures", headers=_get_headers(), params=params, timeout=15)
+        if resp.status_code == 200:
+            fixtures = resp.json().get("response", [])
+            result = [m for f in fixtures if (m := _convert_fixture_to_match(f))]
+            _fixtures_cache[cache_key] = {"data": result, "ts": time.time()}
+            logger.info(f"API-Football fixtures {date_str}: {len(result)} partidos")
+            return result
+        else:
+            logger.warning(f"API-Football fixtures by date {resp.status_code}: {resp.text[:150]}")
+    except Exception as e:
+        logger.error(f"get_fixtures_by_date error: {e}")
+    return []
+
+
+def _convert_fixture_to_match(f: dict):
+    """Convierte fixture de API-Football al formato de partido estandar del bot."""
+    fixture = f.get("fixture", {})
+    league  = f.get("league",  {})
+    teams   = f.get("teams",   {})
+    goals   = f.get("goals",   {})
+    st      = fixture.get("status", {}).get("short", "NS")
+    sport_key = LEAGUE_ID_TO_SPORT_KEY.get(league.get("id"))
+    if st in ("FT", "AET", "PEN"):
+        status = "FINISHED"
+    elif st in ("1H", "HT", "2H", "ET", "P", "BT"):
+        status = "IN_PLAY"
+    else:
+        status = "SCHEDULED"
+    return {
+        "id":      fixture.get("id"),
+        "utcDate": fixture.get("date", ""),
+        "status":  status,
+        "homeTeam": {
+            "id":        teams.get("home", {}).get("id"),
+            "name":      teams.get("home", {}).get("name", ""),
+            "shortName": teams.get("home", {}).get("name", ""),
+        },
+        "awayTeam": {
+            "id":        teams.get("away", {}).get("id"),
+            "name":      teams.get("away", {}).get("name", ""),
+            "shortName": teams.get("away", {}).get("name", ""),
+        },
+        "score": {
+            "fullTime": {"home": goals.get("home"), "away": goals.get("away")},
+            "halfTime": {"home": None, "away": None},
+        },
+        "competition": {
+            "id":   league.get("id"),
+            "name": league.get("name", ""),
+            "code": "",
+        },
+        "_source":          "apifootball",
+        "_sport_key":       sport_key,
+        "_apifb_fixture_id": fixture.get("id"),
+    }
+
+
+def find_fixture_for_pick(home_name: str, away_name: str,
+                           league_id: int = None, date: str = None) -> int | None:
+    """Busca fixture_id para obtener predicciones y alineaciones."""
+    if not _has_key():
+        return None
+    try:
+        today = datetime.now(timezone.utc).date().isoformat()
+        params = {"date": date or today}
+        if league_id:
+            params["league"]  = league_id
+            params["season"]  = _current_season(league_id)
+        resp = requests.get(f"{BASE_URL}/fixtures", headers=_get_headers(), params=params, timeout=10)
+        if resp.status_code == 200:
+            for f in resp.json().get("response", []):
+                fh = f.get("teams", {}).get("home", {}).get("name", "")
+                fa = f.get("teams", {}).get("away", {}).get("name", "")
+                if _similarity(home_name, fh) >= 0.5 and _similarity(away_name, fa) >= 0.5:
+                    fid = f.get("fixture", {}).get("id")
+                    logger.info(f"Fixture found: {fh} vs {fa} => ID {fid}")
+                    return fid
+    except Exception as e:
+        logger.error(f"find_fixture_for_pick error: {e}")
+    return None
+
+
+def get_fixture_predictions(fixture_id: int) -> dict:
+    """Predicciones de API-Football: ganador probable, porcentajes, consejo."""
+    if not _has_key() or not fixture_id:
+        return {}
+    cache_key = f"pred_{fixture_id}"
+    cached = _standings_cache.get(cache_key)
+    if cached and (time.time() - cached["ts"]) < 3600 * 4:
+        return cached["data"]
+    try:
+        resp = requests.get(
+            f"{BASE_URL}/predictions", headers=_get_headers(),
+            params={"fixture": fixture_id}, timeout=10
+        )
+        if resp.status_code == 200:
+            data = resp.json().get("response", [])
+            if data:
+                p = data[0].get("predictions", {})
+                result = {
+                    "winner_name":    (p.get("winner") or {}).get("name"),
+                    "winner_comment": (p.get("winner") or {}).get("comment"),
+                    "advice":         p.get("advice"),
+                    "percent_home":   p.get("percent", {}).get("home"),
+                    "percent_draw":   p.get("percent", {}).get("draw"),
+                    "percent_away":   p.get("percent", {}).get("away"),
+                    "goals_home":     p.get("goals", {}).get("home"),
+                    "goals_away":     p.get("goals", {}).get("away"),
+                    "under_over":     p.get("under_over"),
+                }
+                _standings_cache[cache_key] = {"data": result, "ts": time.time()}
+                logger.info(f"Predictions fixture {fixture_id}: winner={result.get('winner_name')}")
+                return result
+        else:
+            logger.warning(f"API-Football predictions {resp.status_code}")
+    except Exception as e:
+        logger.error(f"get_fixture_predictions error: {e}")
+    return {}
+
+
+def get_fixture_lineups(fixture_id: int) -> dict:
+    """Alineaciones confirmadas del partido (disponibles ~1h antes)."""
+    if not _has_key() or not fixture_id:
+        return {}
+    cache_key = f"lineup_{fixture_id}"
+    cached = _fixtures_cache.get(cache_key)
+    if cached and (time.time() - cached["ts"]) < 1800:
+        return cached["data"]
+    try:
+        resp = requests.get(
+            f"{BASE_URL}/fixtures/lineups", headers=_get_headers(),
+            params={"fixture": fixture_id}, timeout=10
+        )
+        if resp.status_code == 200:
+            data = resp.json().get("response", [])
+            result = {}
+            for td in data:
+                tname = td.get("team", {}).get("name", "")
+                result[tname] = {
+                    "formation": td.get("formation", ""),
+                    "coach":     td.get("coach", {}).get("name", ""),
+                    "starters":  [p.get("player", {}).get("name", "") for p in td.get("startXI", [])],
+                }
+            if result:
+                _fixtures_cache[cache_key] = {"data": result, "ts": time.time()}
+            return result
+        else:
+            logger.warning(f"API-Football lineups {resp.status_code}")
+    except Exception as e:
+        logger.error(f"get_fixture_lineups error: {e}")
+    return {}
+
+
+def get_team_injuries_apifb(team_id: int, league_id: int, season: int = None) -> list:
+    """Lesiones actuales del equipo (fuente real: API-Football)."""
+    if not _has_key() or not team_id or not league_id:
+        return []
+    if not season:
+        season = _current_season(league_id)
+    cache_key = f"inj_{team_id}_{league_id}_{season}"
+    cached = _fixtures_cache.get(cache_key)
+    if cached and (time.time() - cached["ts"]) < 3600 * 3:
+        return cached["data"]
+    try:
+        resp = requests.get(
+            f"{BASE_URL}/injuries", headers=_get_headers(),
+            params={"team": team_id, "league": league_id, "season": season}, timeout=10
+        )
+        if resp.status_code == 200:
+            result = [
+                {"name": i.get("player", {}).get("name", ""),
+                 "type": i.get("type", ""),
+                 "reason": i.get("reason", "")}
+                for i in resp.json().get("response", [])
+            ]
+            _fixtures_cache[cache_key] = {"data": result, "ts": time.time()}
+            logger.info(f"API-Football injuries team={team_id}: {len(result)}")
+            return result
+    except Exception as e:
+        logger.error(f"get_team_injuries_apifb error: {e}")
+    return []
