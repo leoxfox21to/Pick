@@ -36,7 +36,7 @@ from apifootball import (get_full_match_data as apifb_get_full_match_data,
                          get_coach as apifb_get_coach,
                          SPORT_KEY_TO_LEAGUE)
 from weather import get_weather_for_team, format_weather
-from db import (init_db, save_pick, get_history, get_stats as db_get_stats,
+from db import (init_db, save_pick, get_history, get_stats as db_get_stats, get_cache_stats,
                 get_pending_picks, update_pick_result, parse_ai_pick,
                 name_matches, determine_correct,
                 subscribe, unsubscribe, is_subscribed, get_active_subscribers,
@@ -127,7 +127,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📉 /rendimiento — ROI por tipo, confianza y liga\n"
         "🏆 /ligas — Aciertos por liga\n"
         "🤖 /bankroll — Balance autónomo ($90 inicial)\n"
-        "🔔 /alertas — Activar/desactivar alertas automáticas\n\n"
+        "🔔 /alertas — Activar/desactivar alertas automáticas\n"
+        "🗄 /cachestats — Historial acumulado en cache\n\n"
         "_Ejemplo: /pick 3_",
         parse_mode="Markdown"
     )
@@ -1427,6 +1428,7 @@ def main():
     app.add_handler(CommandHandler("bankroll",    cmd_bankroll))
     app.add_handler(CommandHandler("api",         cmd_api))
     app.add_handler(CommandHandler("fuentes",     cmd_fuentes))
+    app.add_handler(CommandHandler("cachestats",  cmd_cachestats))
     logger.info("Bot iniciado con todos los módulos activos.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
@@ -1468,6 +1470,52 @@ async def _notify_bet_resolved(app, pick: dict, resolved_bets: list,
 # ══════════════════════════════════════════════════════════════════════════
 # COMANDO /combinadas — Mejores 2-3 picks del día
 # ══════════════════════════════════════════════════════════════════════════
+
+async def cmd_cachestats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Muestra estadisticas del cache local de partidos historicos."""
+    msg = await update.message.reply_text("⏳ Consultando cache local...")
+    try:
+        stats = get_cache_stats()
+        total = stats.get("total", 0)
+        by_league = stats.get("by_league", [])
+        by_source = stats.get("by_source", [])
+        oldest = stats.get("oldest") or "—"
+        newest = stats.get("newest") or "—"
+
+        lines = ["🗄 <b>CACHE LOCAL DE PARTIDOS</b>\n"]
+        lines.append(f"📦 <b>Total partidos acumulados:</b> {total:,}")
+        lines.append(f"📅 Rango: {oldest} → {newest}\n")
+
+        if by_source:
+            lines.append("📡 <b>Por fuente:</b>")
+            src_icons = {
+                "odds_scores": "🎯 Odds API Scores",
+                "auto":        "⚙️  Auto (bot)",
+                "sofascore":   "📊 SofaScore",
+                "espn":        "🏈 ESPN",
+                "local_cache": "💾 Cache",
+            }
+            for s in by_source:
+                src_name = src_icons.get(s["source"], s["source"])
+                lines.append(f"  {src_name}: <b>{s['total']:,}</b>")
+
+        if total == 0:
+            lines.append("\n⚠️ El cache esta vacio.")
+            lines.append("Analiza picks con /pick para ir acumulando historial.")
+            lines.append("Las ligas sin datos (K League, MLS, etc.)")
+            lines.append("se guardan automaticamente al analizar picks.")
+        else:
+            lines.append(f"\n🏆 <b>Top ligas con mas historial:</b>")
+            for entry in by_league[:15]:
+                comp = _esc(entry["competition"])
+                lines.append(f"  • {comp}: <b>{entry['total']}</b> partidos")
+            if len(by_league) > 15:
+                lines.append(f"  <i>... y {len(by_league) - 15} ligas mas</i>")
+
+        await msg.edit_text("\n".join(lines), parse_mode="HTML")
+    except Exception as e:
+        await msg.edit_text(f"❌ Error: <code>{_esc(str(e)[:150])}</code>", parse_mode="HTML")
+
 
 async def cmd_combinadas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Detecta los 2-3 partidos del día con mayor señal y arma una combinada."""
