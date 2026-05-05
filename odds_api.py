@@ -475,6 +475,89 @@ def get_team_form_from_scores(sport_key, home_name, away_name):
     return home_stats_lite, away_stats_lite, home_rest, away_rest
 
 
+
+def get_match_history_from_scores(sport_key: str, team_name: str, last: int = 20) -> list:
+    """
+    Convierte los scores de The Odds API en objetos de partido estándar
+    (mismo formato que football-data.org) para que el modelo Poisson pueda usarlos.
+    """
+    if not sport_key:
+        return []
+    scores = get_scores_for_sport(sport_key, days_from=30)
+    matches = []
+    for match in scores:
+        if not match.get("completed", False):
+            continue
+        h = match.get("home_team", "")
+        a = match.get("away_team", "")
+        sh = _name_similarity(team_name, h)
+        sa = _name_similarity(team_name, a)
+        if sh < 0.5 and sa < 0.5:
+            continue
+        sc = match.get("scores") or []
+        home_sc = next((s.get("score") for s in sc if s.get("name") == "home"), None)
+        away_sc = next((s.get("score") for s in sc if s.get("name") == "away"), None)
+        if home_sc is None and len(sc) >= 2:
+            home_sc = sc[0].get("score")
+            away_sc = sc[1].get("score")
+        try:
+            home_sc = int(home_sc)
+            away_sc = int(away_sc)
+        except (TypeError, ValueError):
+            continue
+        matches.append({
+            "id": match.get("id"),
+            "utcDate": match.get("commence_time", ""),
+            "status": "FINISHED",
+            "homeTeam": {"id": None, "name": h},
+            "awayTeam": {"id": None, "name": a},
+            "score": {
+                "fullTime": {"home": home_sc, "away": away_sc},
+                "halfTime": {"home": None, "away": None},
+            },
+            "competition": {"id": None, "name": sport_key, "type": "LEAGUE"},
+            "_source": "odds_scores",
+        })
+    matches.sort(key=lambda m: m.get("utcDate", ""), reverse=True)
+    return matches[:last]
+
+
+def save_scores_to_cache_batch(sport_key: str) -> list:
+    """
+    Descarga todos los scores completados y los devuelve en formato
+    listo para guardar en match_history (cache local DB).
+    """
+    if not sport_key:
+        return []
+    scores = get_scores_for_sport(sport_key, days_from=30)
+    result = []
+    for match in scores:
+        if not match.get("completed", False):
+            continue
+        sc = match.get("scores") or []
+        home_sc = next((s.get("score") for s in sc if s.get("name") == "home"), None)
+        away_sc = next((s.get("score") for s in sc if s.get("name") == "away"), None)
+        if home_sc is None and len(sc) >= 2:
+            home_sc = sc[0].get("score")
+            away_sc = sc[1].get("score")
+        try:
+            home_sc = int(home_sc)
+            away_sc = int(away_sc)
+        except (TypeError, ValueError):
+            continue
+        result.append({
+            "home_team": match.get("home_team", ""),
+            "away_team": match.get("away_team", ""),
+            "home_score": home_sc,
+            "away_score": away_sc,
+            "match_date": match.get("commence_time", "")[:10],
+            "competition": sport_key,
+            "sport_key": sport_key,
+            "source": "odds_scores",
+        })
+    return result
+
+
 def _normalize_name(name):
     name = unicodedata.normalize("NFD", name)
     name = "".join(c for c in name if unicodedata.category(c) != "Mn")
