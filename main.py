@@ -295,6 +295,31 @@ async def _cmd_pick_from_cache(update: Update, context: ContextTypes.DEFAULT_TYP
                             get_team_form_from_scores, sport_key, home_name, away_name
                         )
 
+                        # AUTO-CACHE: guardar scores en DB local
+                        try:
+                            from odds_api import save_scores_to_cache_batch
+                            _batch = await asyncio.to_thread(save_scores_to_cache_batch, sport_key)
+                            _saved = 0
+                            for _entry in _batch:
+                                try:
+                                    save_match_to_cache(
+                                        home_team=_entry["home_team"],
+                                        away_team=_entry["away_team"],
+                                        home_score=_entry["home_score"],
+                                        away_score=_entry["away_score"],
+                                        match_date=_entry["match_date"],
+                                        competition=_entry["competition"],
+                                        sport_key=_entry["sport_key"],
+                                        source=_entry["source"],
+                                    )
+                                    _saved += 1
+                                except Exception:
+                                    pass
+                            if _saved:
+                                logger.info(f"Auto-cache: {_saved} partidos guardados de {sport_key}")
+                        except Exception as _ce:
+                            logger.debug(f"Auto-cache error: {_ce}")
+
         elif is_odds_source:
             home_matches, away_matches, home_injuries, away_injuries = await asyncio.gather(
                 asyncio.to_thread(get_team_last_matches, home_id, 50),
@@ -378,6 +403,31 @@ async def _cmd_pick_from_cache(update: Update, context: ContextTypes.DEFAULT_TYP
                 home_stats_scores, away_stats_scores, home_rest_scores, away_rest_scores = await asyncio.to_thread(
                     get_team_form_from_scores, sport_key, home_name, away_name
                 )
+
+                # AUTO-CACHE: guardar scores en DB local
+                try:
+                    from odds_api import save_scores_to_cache_batch
+                    _batch = await asyncio.to_thread(save_scores_to_cache_batch, sport_key)
+                    _saved = 0
+                    for _entry in _batch:
+                        try:
+                            save_match_to_cache(
+                                home_team=_entry["home_team"],
+                                away_team=_entry["away_team"],
+                                home_score=_entry["home_score"],
+                                away_score=_entry["away_score"],
+                                match_date=_entry["match_date"],
+                                competition=_entry["competition"],
+                                sport_key=_entry["sport_key"],
+                                source=_entry["source"],
+                            )
+                            _saved += 1
+                        except Exception:
+                            pass
+                    if _saved:
+                        logger.info(f"Auto-cache: {_saved} partidos guardados de {sport_key}")
+                except Exception as _ce:
+                    logger.debug(f"Auto-cache error: {_ce}")
 
         if stats_limited:
             if not home_stats and home_stats_scores:
