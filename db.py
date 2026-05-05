@@ -83,6 +83,7 @@ def init_db():
                 UNIQUE(home_team, away_team, match_date)
             )
         """)
+        _init_bankroll_tables(conn)
         conn.commit()
     logger.info("DB inicializada correctamente")
 
@@ -498,3 +499,305 @@ def determine_correct(pick_main, home_team, away_team, result_home, result_away)
         return 1 if result_away > result_home else 0
 
     return None
+
+
+# ══════════════════════════════════════════════════════════════
+# BANKROLL AUTÓNOMO — balance $90, Kelly automático
+# ══════════════════════════════════════════════════════════════
+
+STARTING_BALANCE  = 90.0
+MAX_DAILY_EXP_PCT = 0.20   # máx 20% del balance apostado en total por día
+MAX_BET_PCT       = 0.12   # máx 12% del balance por apuesta individual
+MIN_STAKE         = 1.0    # apuesta mínima $1
+
+
+def _init_bankroll_tables(conn):
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS bankroll (
+            id              INTEGER PRIMARY KEY CHECK (id = 1),
+            balance         REAL    NOT NULL DEFAULT 90.0,
+            initial_balance REAL    NOT NULL DEFAULT 90.0,
+            updated_at      TEXT    NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS bankroll_bets (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            pick_id        INTEGER,
+            match_desc     TEXT,
+            pick_label     TEXT,
+            odds           REAL,
+            kelly_pct      REAL,
+            stake          REAL,
+            balance_before REAL,
+            balance_after  REAL,
+            pnl            REAL,
+            status         TEXT NOT NULL DEFAULT 'pending',
+            created_at     TEXT NOT NULL,
+            resolved_at    TEXT
+        )
+    """)
+    existing = conn.execute("SELECT id FROM bankroll WHERE id = 1").fetchone()
+    if not existing:
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "INSERT INTO bankroll (id, balance, initial_balance, updated_at) VALUES (1, ?, ?, ?)",
+            (STARTING_BALANCE, STARTING_BALANCE, now),
+        )
+
+
+def _ensure_bankroll():
+    with get_conn() as conn:
+        _init_bankroll_tables(conn)
+        conn.commit()
+
+
+def get_balance() -> float:
+    try:
+        _ensure_bankroll()
+        with get_conn() as conn:
+            row = conn.execute("SELECT balance FROM bankroll WHERE id = 1").fetchone()
+            return round(row["balance"], 2) if row else STARTING_BALANCE
+    except Exception:
+        return STARTING_BALANCE
+
+
+def get_bankroll_row() -> dict:
+    try:
+        _ensure_bankroll()
+        with get_conn() as conn:
+            row = conn.execute("SELECT * FROM bankroll WHERE id = 1").fetchone()
+            return dict(row) if row else {"balance": STARTING_BALANCE, "initial_balance": STARTING_BALANCE}
+    except Exception:
+        return {"balance": STARTING_BALANCE, "initial_balance": STARTING_BALANCE}
+
+
+def get_today_total_staked() -> float:
+    import zoneinfo
+    cuba = zoneinfo.ZoneInfo("America/Havana")
+    today = datetime.now(cuba).date().isoformat()
+    try:
+        with get_conn() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(stake), 0) AS total FROM bankroll_bets "
+                "WHERE date(created_at) = ? AND status != 'cancelled'",
+                (today,),
+            ).fetchone()
+            return float(row["total"]) if row else 0.0
+    except Exception:
+        return 0.0
+
+
+def place_auto_bet(pick_id: int, match_desc: str, pick_label: str,
+                   odds: float, kelly_pct: float):
+    """Registra una apuesta automática usando Kelly fraccional.
+    Devuelve dict con detalles si se apostó, None si se omitió."""
+    if not kelly_pct or kelly_pct <= 0 or not odds or odds <= 1.0:
+        return None
+    _ensure_bankroll()
+    balance = get_balance()
+    if balance < MIN_STAKE:
+        return None
+
+    raw_stake = balance * kelly_pct / 100.0
+    stake     = max(MIN_STAKE, min(raw_stake, balance * MAX_BET_PCT))
+
+    today_staked    = get_today_total_staked()
+    max_today       = balance * MAX_DAILY_EXP_PCT
+    if today_staked >= max_today:
+        logger.info(f"Auto-bet omitido: límite diario ${max_today:.2f} ya alcanzado (${today_staked:.2f})")
+        return None
+    stake = min(stake, max_today - today_staked)
+    stake = round(stake, 2)
+    if stake < MIN_STAKE:
+        return None
+
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        with get_conn() as conn:
+            cur = conn.execute("""
+                INSERT INTO bankroll_bets
+                (pick_id, match_desc, pick_label, odds, kelly_pct, stake, balance_before, status, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+            """, (pick_id, match_desc, pick_label, odds, kelly_pct, stake, balance, now))
+            conn.commit()
+            bet_id = cur.lastrowid
+        logger.info(f"Auto-bet #{bet_id}: ${stake:.2f} en «{match_desc}» → {pick_label} @ {odds}")
+        return {
+            "id": bet_id, "stake": stake, "odds": odds,
+            "pick_label": pick_label, "match_desc": match_desc,
+            "potential_win": round(stake * (odds - 1), 2),
+            "balance_before": balance,
+        }
+    except Exception as e:
+        logger.error(f"Error place_auto_bet: {e}")
+        return None
+
+
+def resolve_auto_bets_for_pick(pick_id: int, pick_correct: int):
+    """Resuelve todas las apuestas pendientes de un pick cuando llega el resultado.
+    Devuelve lista de resultados o None."""
+    try:
+        _ensure_bankroll()
+        with get_conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM bankroll_bets WHERE pick_id = ? AND status = 'pending'",
+                (pick_id,),
+            ).fetchall()
+        if not rows:
+            return None
+
+        resolved = []
+        for row in rows:
+            bet = dict(row)
+            balance_before = get_balance()
+            stake = bet["stake"]
+            odds  = bet["odds"]
+            now   = datetime.now(timezone.utc).isoformat()
+
+            if pick_correct == 1:
+                pnl         = round(stake * (odds - 1), 2)
+                new_balance = round(balance_before + pnl, 2)
+                status      = "won"
+            else:
+                pnl         = round(-stake, 2)
+                new_balance = round(balance_before + pnl, 2)
+                status      = "lost"
+
+            with get_conn() as conn:
+                conn.execute("""
+                    UPDATE bankroll_bets
+                    SET status = ?, pnl = ?, balance_after = ?, resolved_at = ?
+                    WHERE id = ?
+                """, (status, pnl, new_balance, now, bet["id"]))
+                conn.execute(
+                    "UPDATE bankroll SET balance = ?, updated_at = ? WHERE id = 1",
+                    (new_balance, now),
+                )
+                conn.commit()
+
+            resolved.append({
+                **bet, "status": status, "pnl": pnl,
+                "balance_before": balance_before, "balance_after": new_balance,
+            })
+        return resolved if resolved else None
+    except Exception as e:
+        logger.error(f"Error resolve_auto_bets: {e}")
+        return None
+
+
+def get_bankroll_history(limit: int = 20) -> list:
+    try:
+        _ensure_bankroll()
+        with get_conn() as conn:
+            rows = conn.execute("""
+                SELECT bb.*, p.home_team, p.away_team
+                FROM bankroll_bets bb
+                LEFT JOIN picks p ON bb.pick_id = p.id
+                ORDER BY bb.created_at DESC
+                LIMIT ?
+            """, (limit,)).fetchall()
+            return [dict(r) for r in rows]
+    except Exception as e:
+        logger.error(f"Error get_bankroll_history: {e}")
+        return []
+
+
+def get_bankroll_summary() -> dict:
+    try:
+        _ensure_bankroll()
+        with get_conn() as conn:
+            br     = conn.execute("SELECT * FROM bankroll WHERE id = 1").fetchone()
+            balance = float(br["balance"])   if br else STARTING_BALANCE
+            initial = float(br["initial_balance"]) if br else STARTING_BALANCE
+
+            won     = conn.execute("SELECT COUNT(*) FROM bankroll_bets WHERE status='won'").fetchone()[0]
+            lost    = conn.execute("SELECT COUNT(*) FROM bankroll_bets WHERE status='lost'").fetchone()[0]
+            pending = conn.execute("SELECT COUNT(*) FROM bankroll_bets WHERE status='pending'").fetchone()[0]
+            staked  = conn.execute(
+                "SELECT COALESCE(SUM(stake),0) FROM bankroll_bets WHERE status IN ('won','lost')"
+            ).fetchone()[0]
+            total_pnl = conn.execute(
+                "SELECT COALESCE(SUM(pnl),0) FROM bankroll_bets WHERE pnl IS NOT NULL"
+            ).fetchone()[0]
+
+        roi = round(total_pnl / staked * 100, 1) if staked > 0 else 0.0
+        return {
+            "balance":      round(balance, 2),
+            "initial":      round(initial, 2),
+            "profit":       round(balance - initial, 2),
+            "roi":          roi,
+            "won":          won,
+            "lost":         lost,
+            "pending":      pending,
+            "total_bets":   won + lost + pending,
+            "total_staked": round(staked, 2),
+            "total_pnl":    round(total_pnl, 2),
+            "win_rate":     round(won / (won + lost) * 100, 1) if (won + lost) > 0 else 0.0,
+        }
+    except Exception as e:
+        logger.error(f"Error get_bankroll_summary: {e}")
+        return {}
+
+
+def get_rendimiento_stats() -> dict:
+    """Estadísticas avanzadas: ROI por tipo de pick, por confianza, por liga."""
+    try:
+        with get_conn() as conn:
+            # ROI por tipo de pick
+            by_type = conn.execute("""
+                SELECT
+                    CASE
+                        WHEN lower(pick_main) LIKE '%empate%' OR lower(pick_main) LIKE '%draw%' THEN 'Empate'
+                        WHEN lower(pick_main) LIKE '%visitante%' OR lower(pick_main) LIKE '%away%' THEN 'Visitante'
+                        ELSE 'Local'
+                    END AS tipo,
+                    COUNT(*) AS total,
+                    SUM(CASE WHEN pick_correct=1 THEN 1 ELSE 0 END) AS wins,
+                    ROUND(100.0*SUM(CASE WHEN pick_correct=1 THEN 1 ELSE 0 END)/
+                        NULLIF(SUM(CASE WHEN pick_correct IS NOT NULL THEN 1 ELSE 0 END),0),1) AS acc
+                FROM picks
+                WHERE pick_correct IS NOT NULL AND pick_main IS NOT NULL
+                GROUP BY tipo ORDER BY acc DESC
+            """).fetchall()
+
+            # ROI por confianza
+            by_conf = conn.execute("""
+                SELECT
+                    CASE
+                        WHEN confidence < 60 THEN '50-59%'
+                        WHEN confidence < 70 THEN '60-69%'
+                        WHEN confidence < 80 THEN '70-79%'
+                        WHEN confidence < 90 THEN '80-89%'
+                        ELSE '90%+'
+                    END AS bucket,
+                    COUNT(*) AS total,
+                    SUM(CASE WHEN pick_correct=1 THEN 1 ELSE 0 END) AS wins,
+                    ROUND(100.0*SUM(CASE WHEN pick_correct=1 THEN 1 ELSE 0 END)/
+                        NULLIF(SUM(CASE WHEN pick_correct IS NOT NULL THEN 1 ELSE 0 END),0),1) AS acc
+                FROM picks
+                WHERE pick_correct IS NOT NULL AND confidence IS NOT NULL
+                GROUP BY bucket ORDER BY bucket
+            """).fetchall()
+
+            # Top 3 ligas por acierto (mín 5 picks)
+            top_leagues = conn.execute("""
+                SELECT competition,
+                    COUNT(*) AS total,
+                    SUM(CASE WHEN pick_correct=1 THEN 1 ELSE 0 END) AS wins,
+                    ROUND(100.0*SUM(CASE WHEN pick_correct=1 THEN 1 ELSE 0 END)/
+                        NULLIF(SUM(CASE WHEN pick_correct IS NOT NULL THEN 1 ELSE 0 END),0),1) AS acc
+                FROM picks
+                WHERE pick_correct IS NOT NULL AND competition IS NOT NULL
+                GROUP BY competition HAVING (total) >= 5
+                ORDER BY acc DESC LIMIT 3
+            """).fetchall()
+
+        return {
+            "by_type":    [dict(r) for r in by_type],
+            "by_conf":    [dict(r) for r in by_conf],
+            "top_leagues":[dict(r) for r in top_leagues],
+        }
+    except Exception as e:
+        logger.error(f"Error get_rendimiento_stats: {e}")
+        return {}
