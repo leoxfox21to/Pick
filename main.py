@@ -72,43 +72,40 @@ def utc_to_cuba(utc_str):
 
 
 def _esc(text):
-    """Escapa caracteres especiales de Telegram Markdown en texto variable (_, *, `, [)."""
+    """Escapa caracteres especiales HTML: &, <, > para usar en parse_mode=HTML."""
     if not text:
         return ""
-    return (str(text)
-            .replace("_", "\\_")
-            .replace("*", "\\*")
-            .replace("`", "\\`")
-            .replace("[", "\\["))
+    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def format_match_list(matches, title="HOY"):
+    """Devuelve HTML (parse_mode='HTML') — inmune a guiones bajos y caracteres especiales."""
     if not matches:
         return (
             f"⏰ No hay partidos disponibles {title.lower()}.\n\n"
             "Revisa más tarde o verifica tu ODDS_API_KEY."
         )
     emoji = "🌅" if title == "MAÑANA" else "⚽"
-    lines = [f"{emoji} PARTIDOS {title} 🇨🇺\n"]
+    lines = [f"{emoji} <b>PARTIDOS {title}</b> 🇨🇺\n"]
     for i, m in enumerate(matches, 1):
         raw_home = m.get("homeTeam", {}).get("shortName") or m.get("homeTeam", {}).get("name", "?")
         raw_away = m.get("awayTeam", {}).get("shortName") or m.get("awayTeam", {}).get("name", "?")
         raw_comp = m.get("competition", {}).get("name") or ""
-        home     = _esc(raw_home)
-        away     = _esc(raw_away)
-        comp     = _esc(raw_comp)
+        home      = _esc(raw_home)
+        away      = _esc(raw_away)
+        comp      = _esc(raw_comp)
         time_cuba = utc_to_cuba(m.get("utcDate", ""))
-        status   = m.get("status", "")
-        done     = "✅ " if m.get("id") in analyzed_matches else ""
+        status    = m.get("status", "")
+        done      = "✅ " if m.get("id") in analyzed_matches else ""
         if status in ("IN_PLAY", "PAUSED"):
             status_icon = "🔴 EN VIVO"
         else:
             status_icon = f"🕐 {time_cuba}"
-        lines.append(f"`{i:2d}.` {done}*{home}* vs *{away}*")
+        lines.append(f"<code>{i:2d}.</code> {done}<b>{home}</b> vs <b>{away}</b>")
         lines.append(f"    🏆 {comp} | {status_icon}")
         lines.append("")
-    cmd_hint = "/pick" if title == "HOY" else "/pick\\_manana"
-    lines.append(f"_{cmd_hint} <número> para analizar_")
+    cmd_hint = "/pick" if title == "HOY" else "/pick_manana"
+    lines.append(f"<i>{cmd_hint} &lt;número&gt; para analizar</i>")
     return "\n".join(lines)
 
 
@@ -169,12 +166,12 @@ async def _load_matches_day(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
         text = format_match_list(matches, title=title)
         if saved:
-            text += f"\n_📸 Cuotas guardadas: {saved} partidos_"
-        await msg.edit_text(text, parse_mode="Markdown")
+            text += f"\n<i>📸 Cuotas guardadas: {saved} partidos</i>"
+        await msg.edit_text(text, parse_mode="HTML")
 
     except Exception as e:
         logger.error(f"Error getting matches ({title}): {e}", exc_info=True)
-        await msg.edit_text(f"❌ Error al cargar los partidos.\n`{str(e)[:150]}`", parse_mode="Markdown")
+        await msg.edit_text(f"❌ Error al cargar los partidos.\n<code>{_esc(str(e)[:150])}</code>", parse_mode="HTML")
 
 
 async def cmd_partidos(update: Update, context: ContextTypes.DEFAULT_TYPE):
