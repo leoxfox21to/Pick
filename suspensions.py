@@ -10,19 +10,21 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-APIFB_KEYS = [k for i in ["1", "2", "3"]
-              if (k := os.environ.get(f"API_FOOTBALL_KEY_{i}", "").strip())]
-if not APIFB_KEYS:
-    _fb = os.environ.get("API_FOOTBALL_KEY", "").strip()
-    if _fb:
-        APIFB_KEYS = [_fb]
+def _load_apifb_keys():
+    keys = []
+    for suffix in ["", "_2", "_3", "_4", "_5"]:
+        k = os.environ.get(f"APIFOOTBALL_KEY{suffix}", "").strip()
+        if k:
+            keys.append(k)
+    return keys
+
+APIFB_KEYS = _load_apifb_keys()
 
 _APIFB_URL = "https://v3.football.api-sports.io"
 _key_idx = 0
 _cache = {}
 CACHE_TTL = 3600  # 1h
 
-# Umbrales por liga (número de amarillas antes de suspensión)
 SUSPENSION_THRESHOLD = {
     "soccer_epl": 5,
     "soccer_spain_la_liga": 5,
@@ -46,7 +48,8 @@ DEFAULT_THRESHOLD = 5
 
 
 def _apifb_key():
-    global _key_idx
+    global _key_idx, APIFB_KEYS
+    APIFB_KEYS = _load_apifb_keys()
     if not APIFB_KEYS:
         return None
     key = APIFB_KEYS[_key_idx % len(APIFB_KEYS)]
@@ -61,7 +64,7 @@ def _apifb_get(endpoint, params):
     try:
         resp = requests.get(
             f"{_APIFB_URL}/{endpoint}",
-            headers={"x-rapidapi-key": key, "x-rapidapi-host": "v3.football.api-sports.io"},
+            headers={"x-apisports-key": key},
             params=params,
             timeout=10,
         )
@@ -79,7 +82,7 @@ def get_suspension_risks(team_id: int | None, team_name: str,
     Devuelve lista de jugadores en riesgo de suspensión por acumulación de tarjetas.
     Formato: [{"name": str, "position": str, "yellows": int, "threshold": int, "risk": str}]
     """
-    if not team_id or not APIFB_KEYS:
+    if not team_id or not _load_apifb_keys():
         return []
 
     cache_key = f"susp_{team_id}_{sport_key}"
@@ -94,7 +97,6 @@ def get_suspension_risks(team_id: int | None, team_name: str,
 
     threshold = SUSPENSION_THRESHOLD.get(sport_key, DEFAULT_THRESHOLD)
 
-    # Buscar el league_id correspondiente al sport_key
     from apifootball import SPORT_KEY_TO_LEAGUE
     league_id = SPORT_KEY_TO_LEAGUE.get(sport_key)
     if not league_id:
@@ -111,19 +113,27 @@ def get_suspension_risks(team_id: int | None, team_name: str,
 
     risks = []
     for entry in players:
+        if not isinstance(entry, dict):
+            continue
         player = entry.get("player", {})
+        if not isinstance(player, dict):
+            player = {}
         stats_list = entry.get("statistics", [])
-        if not stats_list:
+        if not stats_list or not isinstance(stats_list, list):
             continue
         stats = stats_list[0]
+        if not isinstance(stats, dict):
+            continue
         cards = stats.get("cards", {})
+        if not isinstance(cards, dict):
+            cards = {}
         yellows = cards.get("yellow", 0) or 0
-        # "yellowred" son dobles amarillas que ya resultaron en expulsión
-        yellows_active = yellows % threshold  # amarillas que cuenta hacia próxima sanción
+        yellows_active = yellows % threshold
 
-        if yellows_active >= threshold - 1:  # 1 amarilla más = suspensión
+        if yellows_active >= threshold - 1:
             name = player.get("name", "?")
-            pos = stats.get("games", {}).get("position", "")
+            games = stats.get("games", {})
+            pos = games.get("position", "") if isinstance(games, dict) else ""
             risk_level = "🚨 SUSPENSIÓN en 1 tarjeta" if yellows_active >= threshold - 1 else "⚠️ En riesgo"
             risks.append({
                 "name": name,
@@ -134,9 +144,8 @@ def get_suspension_risks(team_id: int | None, team_name: str,
                 "risk": risk_level,
             })
 
-    # Ordenar por mayor riesgo primero
     risks.sort(key=lambda x: x["yellows_active"], reverse=True)
-    result = risks[:4]  # máximo 4 jugadores
+    result = risks[:4]
 
     _cache[cache_key] = {"v": result, "ts": time.time()}
     if result:
