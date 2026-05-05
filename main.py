@@ -197,20 +197,9 @@ async def _load_matches_day(update: Update, context: ContextTypes.DEFAULT_TYPE,
                         m["_sport_key"] = ev.get("_sport_key")
                     break
 
-        # Agregar partidos de Odds API que NO estén en API-Football
-        # (ligas exclusivas de Odds API, ej. algunos mercados especiales)
-        _odds_extra = 0
-        for ev in odds_events:
-            eh = ev.get("homeTeam", {}).get("name", "")
-            ea = ev.get("awayTeam", {}).get("name", "")
-            if not _already_in(eh, ea, matches):
-                matches.append(ev)
-                _odds_extra += 1
-
         logger.info(
             f"Partidos {_tgt_date}: {len(_apifb_fx)} API-Football "
-            f"(mostrando {len(matches) - _odds_extra} programados) "
-            f"+ {_odds_extra} exclusivos Odds API = {len(matches)} total"
+            f"mostrando {len(matches)} partidos programados (solo API-Football)."
         )
 
         def _cuba_sort_key(m):
