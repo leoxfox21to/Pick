@@ -89,7 +89,9 @@ def check_apifootball():
             )
             if resp.status_code == 200:
                 data = resp.json().get("response", {})
-                req  = data.get("requests", {})
+                if isinstance(data, list):
+                    data = data[0] if data else {}
+                req  = data.get("requests", {}) if isinstance(data, dict) else {}
                 current   = req.get("current", "?")
                 limit_day = req.get("limit_day", "?")
                 remaining = (limit_day - current) if isinstance(limit_day, int) and isinstance(current, int) else "?"
