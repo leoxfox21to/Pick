@@ -431,7 +431,11 @@ async def _cmd_pick_from_cache(update: Update, context: ContextTypes.DEFAULT_TYP
                 "prob_over25": 50.0, "prob_btts": 50.0,
                 "most_likely_score": "N/A", "top_scores": [],
             }
-            stats_source_note = "⚠️ Solo cuotas (sin historial suficiente)"
+            _has_real_odds = bool(odds.get("home_win") and odds.get("draw") and odds.get("away_win"))
+            if not _has_real_odds:
+                stats_source_note = "SIN_COBERTURA"
+            else:
+                stats_source_note = "SOLO_CUOTAS"
         else:
             poisson_data = poisson_prediction(
                 home_stats.get("avg_home_scored", home_stats.get("avg_scored", 1.2)),
@@ -450,7 +454,14 @@ async def _cmd_pick_from_cache(update: Update, context: ContextTypes.DEFAULT_TYP
             league_key=sport_key
         )
 
-        status_note = stats_source_note if stats_limited else f"✅ Confianza: {confidence_score.get('confidence',0)}%"
+        if stats_limited:
+            _status_map = {
+                "SIN_COBERTURA": "⛔ Liga sin cobertura en APIs...",
+                "SOLO_CUOTAS":   "⚠️ Solo cuotas disponibles (sin historial)...",
+            }
+            status_note = _status_map.get(stats_source_note, f"⚠️ {stats_source_note}")
+        else:
+            status_note = f"✅ Confianza: {confidence_score.get('confidence',0)}%"
         await msg.edit_text(
             f"🔍 Analizando *{home_name}* vs *{away_name}*...\n\n"
             f"{status_note}\n🤖 Generando pick con IA...",
@@ -724,7 +735,39 @@ async def _cmd_pick_from_cache(update: Update, context: ContextTypes.DEFAULT_TYP
         if ht_lines:
             ht_str = "\n⏱️ *Por mitad (promedio):*\n" + "\n".join(ht_lines)
 
-        limited_note = f"\n⚠️ _{stats_source_note}_" if stats_limited else ""
+        if stats_limited:
+            if stats_source_note == "SIN_COBERTURA":
+                limited_note = (
+                    "\n\n⛔ *LIGA SIN COBERTURA EN APIs*\n"
+                    "┌─────────────────────────────\n"
+                    "│ ❌ Sin cuotas de casas de apuesta\n"
+                    "│ ❌ Sin historial de partidos\n"
+                    "│ ❌ Sin estadísticas de equipo\n"
+                    "│\n"
+                    "│ Esta liga no está cubierta por\n"
+                    "│ ninguna de las APIs configuradas.\n"
+                    "│ Las probabilidades son estimadas\n"
+                    "│ (33%/33%/34% por defecto).\n"
+                    "│\n"
+                    "│ ⚠️ Usa este pick con mucha precaución\n"
+                    "└─────────────────────────────"
+                )
+            else:
+                limited_note = (
+                    "\n\n⚠️ *DATOS PARCIALES*\n"
+                    "┌─────────────────────────────\n"
+                    "│ ✅ Cuotas de casas de apuesta\n"
+                    "│ ❌ Sin historial de partidos\n"
+                    "│ ❌ Sin estadísticas de equipo\n"
+                    "│\n"
+                    "│ Las probabilidades se calculan\n"
+                    "│ solo desde las cuotas del mercado.\n"
+                    "│\n"
+                    "│ ⚠️ Confiabilidad reducida\n"
+                    "└─────────────────────────────"
+                )
+        else:
+            limited_note = ""
 
         final_text = (
             f"━━━━━━━━━━━━━━━━━━━━\n"
