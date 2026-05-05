@@ -36,6 +36,13 @@ def _today_str():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
+def _safe_get(obj, key, default=""):
+    """Llama a .get() solo si obj es un dict; si no, devuelve default."""
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return default
+
+
 def get_match_referee(home_name: str, away_name: str) -> dict | None:
     """
     Busca el árbitro designado para un partido buscándolo en los eventos
@@ -57,22 +64,36 @@ def get_match_referee(home_name: str, away_name: str) -> dict | None:
     best_ref = None
     best_score = 0.0
 
-    for ev in data.get("events", []):
-        ht = ev.get("homeTeam", {}).get("name", "")
-        at = ev.get("awayTeam", {}).get("name", "")
-        sh = _team_score(home_name, ht)
-        sa = _team_score(away_name, at)
-        score = sh * sa
-        if score > best_score:
-            best_score = score
-            if score >= 0.4:
-                ref = ev.get("referee", {})
-                if ref and ref.get("name"):
-                    best_ref = {
-                        "name": ref.get("name", ""),
-                        "nationality": ref.get("country", {}).get("name", ""),
-                        "id": ref.get("id"),
-                    }
+    try:
+        for ev in data.get("events", []):
+            if not isinstance(ev, dict):
+                continue
+            home_team = ev.get("homeTeam", {})
+            away_team = ev.get("awayTeam", {})
+            ht = _safe_get(home_team, "name", "")
+            at = _safe_get(away_team, "name", "")
+            sh = _team_score(home_name, ht)
+            sa = _team_score(away_name, at)
+            score = sh * sa
+            if score > best_score:
+                best_score = score
+                if score >= 0.4:
+                    ref = ev.get("referee")
+                    if isinstance(ref, dict) and ref.get("name"):
+                        country = ref.get("country", {})
+                        if isinstance(country, dict):
+                            nationality = country.get("name", "")
+                        elif isinstance(country, str):
+                            nationality = country
+                        else:
+                            nationality = ""
+                        best_ref = {
+                            "name": ref.get("name", ""),
+                            "nationality": nationality,
+                            "id": ref.get("id"),
+                        }
+    except Exception as e:
+        logger.debug(f"get_match_referee loop error: {e}")
 
     _cache[cache_key] = {"v": best_ref, "ts": time.time()}
     if best_ref:
@@ -93,14 +114,13 @@ def get_referee_stats(referee_id: int | None, referee_name: str = "") -> dict | 
     if c and time.time() - c["ts"] < CACHE_TTL_STATS:
         return c["v"]
 
-    # Obtener eventos recientes del árbitro
     events = []
     if referee_id:
         for page in range(3):
             data = _get(f"{BASE_URL}/referee/{referee_id}/events/last/{page}")
             if not data:
                 break
-            evs = data.get("events", [])
+            evs = data.get("events", []) if isinstance(data, dict) else []
             events.extend(evs)
             if len(events) >= 20 or len(evs) < 5:
                 break
@@ -111,31 +131,36 @@ def get_referee_stats(referee_id: int | None, referee_name: str = "") -> dict | 
     total = 0
     yellow_total = 0
     red_total = 0
-    penalties = 0
     home_wins = 0
 
     for ev in events:
-        status_type = ev.get("status", {}).get("type", "")
-        if status_type != "finished":
+        if not isinstance(ev, dict):
             continue
+        try:
+            status = ev.get("status", {})
+            status_type = _safe_get(status, "type", "") if isinstance(status, dict) else ""
+            if status_type != "finished":
+                continue
 
-        hs = ev.get("homeScore", {})
-        as_ = ev.get("awayScore", {})
-        hg = hs.get("current")
-        ag = as_.get("current")
-        if hg is None or ag is None:
+            hs = ev.get("homeScore", {})
+            as_ = ev.get("awayScore", {})
+            hg = _safe_get(hs, "current") if isinstance(hs, dict) else None
+            ag = _safe_get(as_, "current") if isinstance(as_, dict) else None
+            if hg is None or ag is None:
+                continue
+
+            total += 1
+            if hg > ag:
+                home_wins += 1
+
+            y = ev.get("yellowCards", {})
+            r = ev.get("redCards", {})
+            if isinstance(y, dict):
+                yellow_total += (y.get("home", 0) or 0) + (y.get("away", 0) or 0)
+            if isinstance(r, dict):
+                red_total += (r.get("home", 0) or 0) + (r.get("away", 0) or 0)
+        except Exception:
             continue
-
-        total += 1
-        if hg > ag:
-            home_wins += 1
-
-        # Tarjetas desde statistics si disponibles
-        # SofaScore a veces incluye yellowCards en el evento
-        y = ev.get("yellowCards", {})
-        r = ev.get("redCards", {})
-        yellow_total += (y.get("home", 0) or 0) + (y.get("away", 0) or 0)
-        red_total    += (r.get("home", 0) or 0) + (r.get("away", 0) or 0)
 
     if total < 3:
         return None
