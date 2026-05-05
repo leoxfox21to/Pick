@@ -700,3 +700,100 @@ def parse_odds(game):
                     result["btts_no"] = price
 
     return result
+
+
+def get_all_markets_for_event(sport_key: str, event_id: str) -> dict:
+    """
+    Obtiene mercados extendidos para un evento:
+    handicap europeo, asian handicap, BTTS, 1er tiempo.
+    """
+    if not event_id or not sport_key:
+        return {}
+    markets_to_request = [
+        "h2h", "spreads", "totals",
+        "btts", "asian_handicap",
+        "h2h_1st_half", "totals_1st_half",
+    ]
+    result = {}
+    try:
+        url = f"{BASE_URL}/sports/{sport_key}/events/{event_id}/odds"
+        params = {
+            "apiKey":     _next_odds_key(),
+            "regions":    "eu,uk,us",
+            "markets":    ",".join(markets_to_request),
+            "oddsFormat": "decimal",
+        }
+        resp = requests.get(url, params=params, timeout=12)
+        if resp.status_code != 200:
+            logger.warning(f"get_all_markets_for_event {resp.status_code}")
+            return {}
+
+        bookmakers = resp.json().get("bookmakers", [])
+        if not bookmakers:
+            return {}
+
+        # Recopilar todos los mercados de todos los bookmakers disponibles
+        all_mkt = {}
+        for bk in bookmakers:
+            for mkt in bk.get("markets", []):
+                k = mkt.get("key", "")
+                if k not in all_mkt:
+                    all_mkt[k] = mkt.get("outcomes", [])
+
+        def _price(oc, name):
+            for o in oc:
+                if name.lower() in o.get("name", "").lower():
+                    return o.get("price")
+            return None
+
+        def _hcap(oc, idx):
+            if idx < len(oc):
+                return {"line": oc[idx].get("point"), "odds": oc[idx].get("price")}
+            return None
+
+        # Handicap europeo (spreads)
+        if "spreads" in all_mkt:
+            oc = all_mkt["spreads"]
+            h = _hcap(oc, 0)
+            a = _hcap(oc, 1)
+            if h: result["handicap_home"] = h
+            if a: result["handicap_away"] = a
+
+        # Asian Handicap
+        if "asian_handicap" in all_mkt:
+            oc = all_mkt["asian_handicap"]
+            h = _hcap(oc, 0)
+            a = _hcap(oc, 1)
+            if h: result["asian_home"] = h
+            if a: result["asian_away"] = a
+
+        # BTTS
+        if "btts" in all_mkt:
+            oc = all_mkt["btts"]
+            y = _price(oc, "yes")
+            n = _price(oc, "no")
+            if y: result["btts_yes"] = y
+            if n: result["btts_no"]  = n
+
+        # 1er tiempo 1X2
+        if "h2h_1st_half" in all_mkt:
+            oc = all_mkt["h2h_1st_half"]
+            h = _price(oc, "home")
+            d = _price(oc, "draw")
+            a = _price(oc, "away")
+            if h: result["ht_1_home"] = h
+            if d: result["ht_1_draw"] = d
+            if a: result["ht_1_away"] = a
+
+        # Over/Under 1er tiempo
+        if "totals_1st_half" in all_mkt:
+            oc = all_mkt["totals_1st_half"]
+            ov = _price(oc, "over")
+            un = _price(oc, "under")
+            if ov: result["ht_over"] = ov
+            if un: result["ht_under"] = un
+
+        logger.info(f"Expanded markets {event_id}: {list(result.keys())}")
+    except Exception as e:
+        logger.error(f"get_all_markets_for_event error: {e}")
+    return result
