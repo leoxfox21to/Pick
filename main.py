@@ -94,7 +94,8 @@ def format_match_list(matches, title="HOY"):
     if not matches:
         return (
             f"⏰ No hay partidos disponibles {title.lower()}.\n\n"
-            "Revisa más tarde o verifica tu ODDS_API_KEY."
+            "🔁 Ambas fuentes (API-Football + Odds API) están vacías.\n"
+            "Intenta más tarde o verifica las API keys."
         )
     emoji = "🌅" if title == "MAÑANA" else "⚽"
     lines = [f"{emoji} <b>PARTIDOS {title}</b> 🇨🇺\n"]
@@ -112,8 +113,10 @@ def format_match_list(matches, title="HOY"):
             status_icon = "🔴 EN VIVO"
         else:
             status_icon = f"🕐 {time_cuba}"
+        src_icon = "🏟️ " if m.get("_source") == "apifootball" else ""
+        odds_icon = "💰" if m.get("_event_id") else ""
         lines.append(f"<code>{i:2d}.</code> {done}<b>{home}</b> vs <b>{away}</b>")
-        lines.append(f"    🏆 {comp} | {status_icon}")
+        lines.append(f"    🏆 {comp} | {status_icon} {src_icon}{odds_icon}")
         lines.append("")
     cmd_hint = "/pick" if title == "HOY" else "/pick_manana"
     lines.append(f"<i>{cmd_hint} &lt;número&gt; para analizar</i>")
@@ -149,35 +152,66 @@ async def _load_matches_day(update: Update, context: ContextTypes.DEFAULT_TYPE,
         fetcher = get_todays_events if offset_days == 0 else get_tomorrows_events
         import datetime as _dtmod
         _tgt_date = (_dtmod.date.today() + _dtmod.timedelta(days=offset_days)).isoformat()
-        matches, all_odds, _apifb_fx = await asyncio.gather(
-            asyncio.to_thread(fetcher),
-            asyncio.to_thread(get_all_odds),
-            asyncio.to_thread(apifb_fixtures_by_date, _tgt_date),
+
+        # ── API-Football = FUENTE PRIMARIA | Odds API = cuotas y _event_id ──────
+        _apifb_fx, odds_events, all_odds = await asyncio.gather(
+            asyncio.to_thread(apifb_fixtures_by_date, _tgt_date),   # PRINCIPAL
+            asyncio.to_thread(fetcher),                               # para _event_id
+            asyncio.to_thread(get_all_odds),                          # para cuotas
         )
 
-        # Merge: agregar partidos de API-Football no cubiertos por Odds API
-        def _tok_overlap(a, b):
+        # Función de similitud de nombres (tokens comunes)
+        def _tok_match(a, b):
             a, b = a.lower(), b.lower()
+            if a[:5] == b[:5]:
+                return True
             wa = {w for w in a.split() if len(w) > 3}
             wb = {w for w in b.split() if len(w) > 3}
-            return bool(wa & wb) or a[:5] in b or b[:5] in a
+            return bool(wa & wb)
 
         def _already_in(home, away, lst):
             return any(
-                _tok_overlap(home, m.get("homeTeam", {}).get("name", "")) and
-                _tok_overlap(away, m.get("awayTeam", {}).get("name", ""))
+                _tok_match(home, m.get("homeTeam", {}).get("name", "")) and
+                _tok_match(away, m.get("awayTeam", {}).get("name", ""))
                 for m in lst
             )
 
-        _merged = sum(
-            1 for fx in _apifb_fx
-            if fx.get("status") == "SCHEDULED" and
-               not _already_in(fx.get("homeTeam", {}).get("name", ""),
-                                fx.get("awayTeam", {}).get("name", ""), matches)
-            and matches.append(fx) is None
+        # API-Football es la base — filtramos solo SCHEDULED e IN_PLAY (no FINISHED)
+        matches = [
+            fx for fx in _apifb_fx
+            if fx.get("status") in ("SCHEDULED", "IN_PLAY", "PAUSED", "TIMED")
+        ]
+
+        # Anotar cada partido de API-Football con el _event_id de Odds API
+        # (necesario para obtener cuotas en /pick)
+        for m in matches:
+            mh = m.get("homeTeam", {}).get("name", "")
+            ma = m.get("awayTeam", {}).get("name", "")
+            for ev in odds_events:
+                eh = ev.get("homeTeam", {}).get("name", "")
+                ea = ev.get("awayTeam", {}).get("name", "")
+                if _tok_match(mh, eh) and _tok_match(ma, ea):
+                    if not m.get("_event_id"):
+                        m["_event_id"] = ev.get("_event_id")
+                    if not m.get("_sport_key"):
+                        m["_sport_key"] = ev.get("_sport_key")
+                    break
+
+        # Agregar partidos de Odds API que NO estén en API-Football
+        # (ligas exclusivas de Odds API, ej. algunos mercados especiales)
+        _odds_extra = 0
+        for ev in odds_events:
+            eh = ev.get("homeTeam", {}).get("name", "")
+            ea = ev.get("awayTeam", {}).get("name", "")
+            if not _already_in(eh, ea, matches):
+                matches.append(ev)
+                _odds_extra += 1
+
+        logger.info(
+            f"Partidos {_tgt_date}: {len(_apifb_fx)} API-Football "
+            f"(mostrando {len(matches) - _odds_extra} programados) "
+            f"+ {_odds_extra} exclusivos Odds API = {len(matches)} total"
         )
-        if _merged:
-            logger.info(f"API-Football merge: +{_merged} partidos extra")
 
         def _cuba_sort_key(m):
             utc_str = m.get("utcDate", "")
