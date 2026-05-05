@@ -474,10 +474,7 @@ def get_cache_team_count(team_name: str) -> int:
 
 
 def get_cache_stats() -> dict:
-    """
-    Devuelve estadísticas del cache local de partidos (match_history).
-    Retorna total de partidos, desglose por liga y por fuente.
-    """
+    """Devuelve estadisticas del cache local de partidos (match_history)."""
     try:
         with get_conn() as conn:
             total = conn.execute("SELECT COUNT(*) FROM match_history").fetchone()[0]
