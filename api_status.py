@@ -88,13 +88,15 @@ def check_apifootball():
                 timeout=10,
             )
             if resp.status_code == 200:
-                data = resp.json().get("response", {})
-                if isinstance(data, list):
-                    data = data[0] if data else {}
-                req  = data.get("requests", {}) if isinstance(data, dict) else {}
-                current   = req.get("current", "?")
-                limit_day = req.get("limit_day", "?")
-                remaining = (limit_day - current) if isinstance(limit_day, int) and isinstance(current, int) else "?"
+                # Los límites vienen en los headers de la respuesta
+                limit_day = resp.headers.get("x-ratelimit-requests-limit", None)
+                remaining = resp.headers.get("x-ratelimit-requests-remaining", None)
+                try:
+                    limit_day = int(limit_day) if limit_day is not None else "?"
+                    remaining = int(remaining) if remaining is not None else "?"
+                    current   = (limit_day - remaining) if isinstance(limit_day, int) and isinstance(remaining, int) else "?"
+                except Exception:
+                    limit_day, remaining, current = "?", "?", "?"
                 results.append({
                     "key_num": idx,
                     "ok": True,
