@@ -25,7 +25,7 @@ from analyzer import (extract_team_stats, poisson_prediction, h2h_stats,
                       calculate_value_bet, calculate_streak, days_since_last_match,
                       calculate_confidence_score, halftime_stats, day_of_week_stats,
                       night_vs_day_stats, post_cup_fatigue, half_season_stats,
-                      get_xg_from_matches, odds_range_performance,
+                      get_xg_from_matches, get_xg_proxy_from_stats, odds_range_performance,
                       MIN_MATCHES_POISSON, market_vs_model_conflict,
                       kelly_criterion, get_league_efficiency_label)
 from injuries_api import get_team_injuries, format_injuries
@@ -41,7 +41,10 @@ from db import (init_db, save_pick, get_history, get_stats as db_get_stats,
                 subscribe, unsubscribe, is_subscribed, get_active_subscribers,
                 mark_alert_sent, alert_already_sent,
                 save_match_to_cache, get_team_matches_from_cache,
-                get_stats_by_league, get_calibration_stats, save_closing_odds)
+                get_stats_by_league, get_calibration_stats, save_closing_odds,
+                place_auto_bet, resolve_auto_bets_for_pick,
+                get_balance, get_bankroll_summary, get_bankroll_history,
+                get_today_total_staked, get_rendimiento_stats)
 from odds_tracker import save_odds_snapshot, get_odds_movement, get_closing_odds, calculate_clv, get_clv_label
 from data_aggregator import get_extended_match_data
 from referee import get_match_referee, get_referee_stats, format_referee_for_telegram
@@ -116,9 +119,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🌅 /manana — Partidos de MAÑANA\n"
         "🔍 /pick <n> — Análisis completo con IA\n"
         "🌅 /pick\\_manana <n> — Análisis partido de mañana\n"
+        "🎯 /combinadas — Mejores 2-3 picks del día\n"
         "📊 /historial — Últimos picks con resultados\n"
         "📈 /stats — Estadísticas de aciertos globales\n"
+        "📉 /rendimiento — ROI por tipo, confianza y liga\n"
         "🏆 /ligas — Aciertos por liga\n"
+        "🤖 /bankroll — Balance autónomo ($90 inicial)\n"
         "🔔 /alertas — Activar/desactivar alertas automáticas\n\n"
         "_Ejemplo: /pick 3_",
         parse_mode="Markdown"
@@ -365,9 +371,13 @@ async def _cmd_pick_from_cache(update: Update, context: ContextTypes.DEFAULT_TYP
             if not away_stats and away_stats_scores:
                 away_stats = away_stats_scores
 
-        # ── xG desde partidos SofaScore ──────────────────────────────
+        # ── xG desde partidos SofaScore, con proxy como fallback ────
         home_xg = get_xg_from_matches(home_matches, home_id) if home_matches and home_id else {}
         away_xg = get_xg_from_matches(away_matches, away_id) if away_matches and away_id else {}
+        if not home_xg and home_stats:
+            home_xg = get_xg_proxy_from_stats(home_stats, sport_key)
+        if not away_xg and away_stats:
+            away_xg = get_xg_proxy_from_stats(away_stats, sport_key)
 
         # ── Cuotas ───────────────────────────────────────────────────
         all_odds = await asyncio.to_thread(get_all_odds)
@@ -487,6 +497,26 @@ async def _cmd_pick_from_cache(update: Update, context: ContextTypes.DEFAULT_TYP
             closing = get_closing_odds(odds_event_id)
             if closing and closing.get("home_win"):
                 save_closing_odds(pick_id, closing.get("home_win"), closing.get("draw"), closing.get("away_win"))
+
+        # ── Auto-bet bankroll autónomo ───────────────────────────────
+        auto_bet_info = None
+        if pick_id and parsed.get("confidence", 0) and (parsed.get("confidence", 0) >= 58):
+            _leader = confidence_score.get("leader", "") if confidence_score else ""
+            if _leader == "home":   _bet_odds = odds.get("home_win"); _kelly_auto = kelly_h
+            elif _leader == "draw": _bet_odds = odds.get("draw");     _kelly_auto = kelly_d
+            elif _leader == "away": _bet_odds = odds.get("away_win"); _kelly_auto = kelly_a
+            else:                    _bet_odds = parsed.get("odds_recommended"); _kelly_auto = None
+            if not _kelly_auto:
+                _kelly_auto = kelly_criterion(parsed.get("confidence", 0), _bet_odds)
+            if _kelly_auto and _bet_odds and _bet_odds > 1.0:
+                _pick_label = parsed.get("pick_main") or f"Pick principal"
+                auto_bet_info = place_auto_bet(
+                    pick_id=pick_id,
+                    match_desc=f"{home_name} vs {away_name}",
+                    pick_label=_pick_label,
+                    odds=_bet_odds,
+                    kelly_pct=_kelly_auto,
+                )
 
         # ── Strings para el mensaje ──────────────────────────────────
         value_home = calculate_value_bet(poisson_data["prob_home_win"], odds.get("home_win"))
@@ -729,6 +759,16 @@ async def _cmd_pick_from_cache(update: Update, context: ContextTypes.DEFAULT_TYP
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"{ai_result}"
         )
+        if auto_bet_info:
+            _bal = get_balance()
+            final_text += (
+                f"\n\n━━━━━━━━━━━━━━━━━━━━\n"
+                f"🤖 *AUTO-BET REGISTRADO:*\n"
+                f"💵 Apuesta: *${auto_bet_info['stake']:.2f}* @ {auto_bet_info['odds']}\n"
+                f"🎯 Pick: {auto_bet_info['pick_label']}\n"
+                f"💰 Ganancia potencial: *${auto_bet_info['potential_win']:.2f}*\n"
+                f"🏦 Balance actual: *${_bal:.2f}*"
+            )
 
         analyzed_matches.add(match_id)
         await msg.edit_text(final_text, parse_mode="Markdown")
@@ -854,7 +894,7 @@ async def cmd_ligas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
-async def _check_results_once():
+async def _check_results_once(app=None):
     pending = get_pending_picks()
     if not pending:
         return
@@ -904,11 +944,11 @@ async def _check_results_once():
             logger.error(f"Error verificando resultados {sport_key}: {e}")
 
 
-async def results_loop():
+async def results_loop(app=None):
     await asyncio.sleep(300)
     while True:
         try:
-            await _check_results_once()
+            await _check_results_once(app)
         except Exception as e:
             logger.error(f"Error en results_loop: {e}")
         await asyncio.sleep(7200)
@@ -1028,9 +1068,11 @@ async def cmd_alertas(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def post_init(app):
-    asyncio.create_task(results_loop())
+    asyncio.create_task(results_loop(app))
     asyncio.create_task(alerts_loop(app))
-    logger.info("Loops de resultados y alertas iniciados.")
+    asyncio.create_task(line_movement_loop(app))
+    asyncio.create_task(daily_bankroll_report_loop(app))
+    logger.info("Loops de resultados, alertas, movimiento de línea y bankroll iniciados.")
 
 
 def main():
@@ -1053,9 +1095,400 @@ def main():
     app.add_handler(CommandHandler("stats",       cmd_stats))
     app.add_handler(CommandHandler("ligas",       cmd_ligas))
     app.add_handler(CommandHandler("alertas",     cmd_alertas))
-    logger.info("Bot iniciado. /partidos /manana /pick /pick_manana /historial /stats /ligas /alertas")
+    app.add_handler(CommandHandler("combinadas",  cmd_combinadas))
+    app.add_handler(CommandHandler("rendimiento", cmd_rendimiento))
+    app.add_handler(CommandHandler("bankroll",    cmd_bankroll))
+    logger.info("Bot iniciado con todos los módulos activos.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
     main()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# NOTIFICACIÓN AUTO-BET RESUELTO
+# ══════════════════════════════════════════════════════════════════════════
+
+async def _notify_bet_resolved(app, pick: dict, resolved_bets: list,
+                                home_score: int, away_score: int):
+    """Envía notificación a todos los suscriptores cuando una apuesta auto se resuelve."""
+    subscribers = get_active_subscribers()
+    if not subscribers:
+        return
+    balance = get_balance()
+    for bet in resolved_bets:
+        icon    = "✅ GANADA" if bet["status"] == "won" else "❌ PERDIDA"
+        pnl     = bet["pnl"]
+        pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
+        text = (
+            f"🤖 *AUTO-BET {icon}*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"⚽ *{pick['home_team']}* {home_score}-{away_score} *{pick['away_team']}*\n"
+            f"🎯 Pick: _{bet['pick_label']}_\n"
+            f"💰 Apuesta: ${bet['stake']:.2f} @ {bet['odds']}\n"
+            f"📊 Resultado: *{pnl_str}*\n"
+            f"🏦 Balance: *${balance:.2f}*\n"
+            f"━━━━━━━━━━━━━━━━━━━━"
+        )
+        for chat_id in subscribers:
+            try:
+                await app.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+            except Exception as e:
+                logger.warning(f"Error notif bet_resolved a {chat_id}: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# COMANDO /combinadas — Mejores 2-3 picks del día
+# ══════════════════════════════════════════════════════════════════════════
+
+async def cmd_combinadas(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Detecta los 2-3 partidos del día con mayor señal y arma una combinada."""
+    cache = matches_cache if matches_cache else tomorrow_cache
+    if not cache:
+        await update.message.reply_text(
+            "⚠️ Primero ejecuta /partidos (o /manana) para cargar la lista."
+        )
+        return
+
+    msg = await update.message.reply_text("🎯 Buscando mejores señales del día...")
+    try:
+        all_odds = await asyncio.to_thread(get_all_odds)
+        candidates = []
+        for num, event in cache.items():
+            home_name   = event.get("homeTeam", {}).get("name", "")
+            away_name   = event.get("awayTeam", {}).get("name", "")
+            competition = event.get("competition", {}).get("name", "?")
+            time_cuba   = utc_to_cuba(event.get("utcDate", ""))
+            sport_key   = event.get("_sport_key", "")
+            odds = find_odds_for_match(home_name, away_name, all_odds) or {}
+            if not odds:
+                continue
+            best = None
+            for label, odds_val in [
+                (f"Victoria {home_name}", odds.get("home_win")),
+                (f"Victoria {away_name}", odds.get("away_win")),
+                (f"Over 2.5 goles",       odds.get("over_25")),
+                (f"Under 2.5 goles",      odds.get("under_25")),
+            ]:
+                if not odds_val or odds_val <= 1.0:
+                    continue
+                imp = 1.0 / odds_val
+                kelly_pct = kelly_criterion(imp * 100, odds_val)
+                if kelly_pct and kelly_pct > 0 and imp >= 0.58:
+                    if not best or imp > best["imp"]:
+                        best = {
+                            "label": label, "odds": odds_val,
+                            "imp": imp, "kelly": kelly_pct,
+                        }
+            if best:
+                candidates.append({
+                    "num": num, "home": home_name, "away": away_name,
+                    "competition": competition, "time": time_cuba,
+                    "pick": best,
+                })
+
+        if not candidates:
+            await msg.edit_text(
+                "📭 No se encontraron señales con ventaja matemática positiva hoy.\n"
+                "_Intenta de nuevo más tarde cuando actualicen las cuotas._",
+                parse_mode="Markdown"
+            )
+            return
+
+        # Ordenar por Kelly descendente y tomar top 3
+        candidates.sort(key=lambda x: x["pick"]["kelly"], reverse=True)
+        top = candidates[:3]
+
+        # Probabilidad combinada (producto de probabilidades implícitas)
+        combined_prob = 1.0
+        for c in top:
+            combined_prob *= c["pick"]["imp"]
+        combined_odds = round(1.0 / combined_prob, 2) if combined_prob > 0 else 0
+        combined_pct  = round(combined_prob * 100, 1)
+
+        balance = get_balance()
+        # Kelly para la combinada (mucho más conservador — 10% del Kelly individual)
+        kelly_combined = kelly_criterion(combined_pct, combined_odds, fraction=0.10)
+        stake_combined = round(balance * kelly_combined / 100, 2) if kelly_combined else 0
+
+        lines = [f"🎯 *COMBINADA DEL DÍA* ({len(top)} picks)\n"]
+        for i, c in enumerate(top, 1):
+            pk = c["pick"]
+            lines.append(
+                f"*{i}. {c['home']}* vs *{c['away']}*\n"
+                f"   🏆 {c['competition']} | 🕐 {c['time']}\n"
+                f"   ✅ *{pk['label']}* @ {pk['odds']:.2f}\n"
+                f"   📊 Prob: {round(pk['imp']*100,1)}% | Kelly: {pk['kelly']}% bankroll\n"
+                f"   _/pick {c['num']} para análisis completo_\n"
+            )
+
+        lines.append("━━━━━━━━━━━━━━━━━━━━")
+        lines.append(f"🎰 *Cuota combinada: {combined_odds}*")
+        lines.append(f"📊 *Prob. combinada: {combined_pct}%*")
+        lines.append(f"🏦 Balance actual: ${balance:.2f}")
+        if stake_combined >= 1.0:
+            lines.append(f"💸 *Apuesta sugerida: ${stake_combined:.2f}* (Kelly conservador)")
+        else:
+            lines.append("⚠️ _Combinada con bajo Kelly — considera picks individuales_")
+        lines.append("\n_⚠️ Las combinadas multiplican el riesgo. El bot prefiere picks individuales._")
+
+        await msg.edit_text("\n".join(lines), parse_mode="Markdown")
+
+    except Exception as e:
+        logger.error(f"Error en cmd_combinadas: {e}", exc_info=True)
+        await msg.edit_text(f"❌ Error buscando combinadas.\n`{str(e)[:150]}`", parse_mode="Markdown")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# COMANDO /rendimiento — ROI desglosado
+# ══════════════════════════════════════════════════════════════════════════
+
+async def cmd_rendimiento(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    stats   = db_get_stats()
+    rend    = get_rendimiento_stats()
+    summary = get_bankroll_summary()
+
+    if not stats or stats.get("total", 0) == 0:
+        await update.message.reply_text(
+            "📉 *Rendimiento*\n\n_Aún no hay suficientes picks resueltos._",
+            parse_mode="Markdown"
+        )
+        return
+
+    lines = ["📉 *RENDIMIENTO DETALLADO*\n━━━━━━━━━━━━━━━━━━━━"]
+
+    # Resumen global
+    acc = stats.get("accuracy", 0)
+    acc_icon = "🔥" if acc >= 65 else "📊" if acc >= 50 else "📉"
+    lines.append(f"{acc_icon} *Acierto global: {acc}%* ({stats['correct']}/{stats['resolved']})")
+    lines.append(f"⏳ Pendientes: {stats.get('pending', 0)}\n")
+
+    # Por tipo de pick
+    if rend.get("by_type"):
+        lines.append("🔢 *Por tipo de pick:*")
+        for row in rend["by_type"]:
+            acc_t = row.get("acc") or 0
+            icon = "✅" if acc_t >= 55 else "⚠️" if acc_t >= 40 else "❌"
+            lines.append(
+                f"  {icon} {row['tipo']}: {row.get('wins',0)}/{row.get('total',0)} → *{acc_t}%*"
+            )
+        lines.append("")
+
+    # Por confianza
+    if rend.get("by_conf"):
+        lines.append("🎯 *Por nivel de confianza:*")
+        for row in rend["by_conf"]:
+            acc_c  = row.get("acc") or 0
+            bucket = row.get("bucket", "?")
+            try:
+                mid  = int(bucket.split("-")[0].replace("%+","").replace("%",""))
+                diff = acc_c - mid
+                cal  = "✅" if abs(diff) <= 8 else ("📈" if diff > 0 else "📉")
+            except Exception:
+                cal = "📊"
+            lines.append(
+                f"  {cal} {bucket}: {row.get('wins',0)}/{row.get('total',0)} → *{acc_c}%*"
+            )
+        lines.append("")
+
+    # Top ligas
+    if rend.get("top_leagues"):
+        lines.append("🏆 *Top ligas (mín. 5 picks):*")
+        for row in rend["top_leagues"]:
+            acc_l = row.get("acc") or 0
+            comp  = row.get("competition", "?")[:30]
+            lines.append(f"  🔥 {comp}: {row.get('wins',0)}/{row.get('total',0)} → *{acc_l}%*")
+        lines.append("")
+
+    # Bankroll autónomo
+    if summary.get("total_bets", 0) > 0:
+        p_icon = "📈" if summary.get("profit", 0) >= 0 else "📉"
+        lines.append("━━━━━━━━━━━━━━━━━━━━")
+        lines.append(f"🤖 *Bankroll autónomo:*")
+        lines.append(f"  🏦 Balance: ${summary['balance']:.2f} (inicial ${summary['initial']:.2f})")
+        lines.append(
+            f"  {p_icon} P&L: ${summary['profit']:+.2f} | ROI: {summary['roi']:+.1f}%"
+        )
+        lines.append(
+            f"  📊 {summary['won']}G / {summary['lost']}P / {summary['pending']}⏳ "
+            f"({summary.get('win_rate',0):.0f}% ganados)"
+        )
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# COMANDO /bankroll — Balance autónomo
+# ══════════════════════════════════════════════════════════════════════════
+
+async def cmd_bankroll(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    summary = get_bankroll_summary()
+    history = get_bankroll_history(10)
+    balance = summary.get("balance", 90.0)
+    profit  = summary.get("profit", 0.0)
+    roi     = summary.get("roi", 0.0)
+
+    p_icon  = "📈" if profit >= 0 else "📉"
+    lines   = [
+        f"🤖 *BANKROLL AUTÓNOMO*",
+        f"━━━━━━━━━━━━━━━━━━━━",
+        f"🏦 *Balance: ${balance:.2f}*",
+        f"💰 Balance inicial: ${summary.get('initial', 90.0):.2f}",
+        f"{p_icon} P&L total: *${profit:+.2f}* | ROI: *{roi:+.1f}%*",
+        f"━━━━━━━━━━━━━━━━━━━━",
+        f"📊 Apuestas: {summary.get('won',0)}✅ {summary.get('lost',0)}❌ {summary.get('pending',0)}⏳",
+        f"💵 Total apostado: ${summary.get('total_staked', 0):.2f}",
+        f"━━━━━━━━━━━━━━━━━━━━",
+    ]
+
+    if history:
+        lines.append("📋 *Últimas 10 apuestas:*")
+        for bet in history:
+            status = bet.get("status", "pending")
+            icon   = "✅" if status == "won" else "❌" if status == "lost" else "⏳"
+            pnl    = bet.get("pnl")
+            pnl_str = f" (${pnl:+.2f})" if pnl is not None else ""
+            date_s = (bet.get("created_at") or "")[:10]
+            lines.append(
+                f"{icon} `{date_s}` _{bet.get('pick_label','?')[:35]}_\n"
+                f"   ${bet.get('stake',0):.2f} @ {bet.get('odds',0):.2f}{pnl_str}"
+            )
+    else:
+        lines.append("_Todavía no hay apuestas registradas._\n_Las apuestas se registran automáticamente con cada /pick._")
+
+    lines.append(f"\n_Reglas: máx 12% por apuesta | máx 20% por día_")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# LOOP: MOVIMIENTO DE LÍNEA — alerta si cuota cambia >10%
+# ══════════════════════════════════════════════════════════════════════════
+
+async def _check_line_movements(app):
+    """Compara cuotas actuales con snapshots guardados. Alerta si cambian >10%."""
+    cache = matches_cache
+    if not cache:
+        return
+    subscribers = get_active_subscribers()
+    if not subscribers:
+        return
+    try:
+        all_odds = await asyncio.to_thread(get_all_odds)
+    except Exception as e:
+        logger.warning(f"_check_line_movements: error fetching odds: {e}")
+        return
+
+    alerts_sent = []
+    for num, event in cache.items():
+        home_name = event.get("homeTeam", {}).get("name", "")
+        away_name = event.get("awayTeam", {}).get("name", "")
+        match_id  = event.get("id")
+        status    = event.get("status", "")
+        if status in ("FINISHED", "IN_PLAY", "PAUSED"):
+            continue
+        current_odds = find_odds_for_match(home_name, away_name, all_odds) or {}
+        if not current_odds:
+            continue
+        movement = get_odds_movement(match_id, current_odds)
+        if movement and movement.get("alert"):
+            time_cuba   = utc_to_cuba(event.get("utcDate", ""))
+            competition = event.get("competition", {}).get("name", "?")
+            text = (
+                f"📊 *MOVIMIENTO DE CUOTA SIGNIFICATIVO*\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"⚽ *{home_name}* vs *{away_name}*\n"
+                f"🏆 {competition} | 🕐 {time_cuba}\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+            )
+            for mv in movement["movements"]:
+                text += f"{mv}\n"
+            text += f"━━━━━━━━━━━━━━━━━━━━\n"
+            text += f"_/pick {num} para análisis completo_"
+            alerts_sent.append(f"{home_name} vs {away_name}")
+            # Save new snapshot
+            save_odds_snapshot(match_id, home_name, away_name, current_odds)
+            for chat_id in subscribers:
+                try:
+                    await app.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+                except Exception as e:
+                    logger.warning(f"Error línea móvil a {chat_id}: {e}")
+    if alerts_sent:
+        logger.info(f"Alertas movimiento línea enviadas: {alerts_sent}")
+
+
+async def line_movement_loop(app):
+    await asyncio.sleep(180)
+    while True:
+        try:
+            now_cuba = datetime.now(CUBA_TZ)
+            if 7 <= now_cuba.hour <= 23:
+                await _check_line_movements(app)
+            else:
+                logger.info("line_movement_loop: fuera de horario.")
+        except Exception as e:
+            logger.error(f"Error en line_movement_loop: {e}")
+        await asyncio.sleep(7200)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# LOOP: REPORTE DIARIO BANKROLL a las 23:00 Cuba
+# ══════════════════════════════════════════════════════════════════════════
+
+async def _send_daily_bankroll_report(app):
+    subscribers = get_active_subscribers()
+    if not subscribers:
+        return
+    summary = get_bankroll_summary()
+    if summary.get("total_bets", 0) == 0:
+        return
+
+    profit = summary.get("profit", 0.0)
+    roi    = summary.get("roi", 0.0)
+    p_icon = "📈" if profit >= 0 else "📉"
+    today_str = datetime.now(CUBA_TZ).strftime("%d/%m/%Y")
+
+    text = (
+        f"🤖 *REPORTE DIARIO — {today_str}*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🏦 *Balance: ${summary['balance']:.2f}*\n"
+        f"{p_icon} P&L total: ${profit:+.2f} | ROI: {roi:+.1f}%\n"
+        f"📊 {summary['won']}✅ {summary['lost']}❌ {summary['pending']}⏳\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+    )
+    # Today's bets
+    import zoneinfo
+    cuba = zoneinfo.ZoneInfo("America/Havana")
+    today_date = datetime.now(cuba).date().isoformat()
+    history = get_bankroll_history(30)
+    today_bets = [b for b in history if (b.get("created_at") or "")[:10] == today_date]
+    if today_bets:
+        text += "*Apuestas de hoy:*\n"
+        for bet in today_bets:
+            icon = "✅" if bet["status"] == "won" else "❌" if bet["status"] == "lost" else "⏳"
+            pnl  = bet.get("pnl")
+            pnl_str = f" ${pnl:+.2f}" if pnl is not None else ""
+            text += f"  {icon} _{bet.get('pick_label','?')[:35]}_ ${bet.get('stake',0):.2f}{pnl_str}\n"
+    else:
+        text += "_Sin apuestas hoy._\n"
+
+    for chat_id in subscribers:
+        try:
+            await app.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+        except Exception as e:
+            logger.warning(f"Error reporte diario a {chat_id}: {e}")
+
+
+async def daily_bankroll_report_loop(app):
+    while True:
+        now_cuba = datetime.now(CUBA_TZ)
+        target   = now_cuba.replace(hour=23, minute=0, second=0, microsecond=0)
+        if now_cuba >= target:
+            target += timedelta(days=1)
+        wait_secs = (target - now_cuba).total_seconds()
+        logger.info(f"daily_bankroll_report_loop: próximo reporte en {wait_secs/3600:.1f}h")
+        await asyncio.sleep(wait_secs)
+        try:
+            await _send_daily_bankroll_report(app)
+        except Exception as e:
+            logger.error(f"Error en daily_bankroll_report_loop: {e}")
