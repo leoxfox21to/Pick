@@ -2,6 +2,7 @@ import os
 import re
 import logging
 import requests
+from analyzer import market_vs_model_conflict, kelly_criterion, get_league_efficiency_label
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +37,7 @@ def _call_groq(prompt):
 
     body = {
         "model":       GROQ_MODEL,
-        "max_tokens":  800,
+        "max_tokens":  900,
         "temperature": 0.3,
         "messages":    [{"role": "user", "content": prompt}],
     }
@@ -71,13 +72,22 @@ def _call_groq(prompt):
 
 
 def _cap_confidence_in_text(text, cap):
-    """FIX C: reemplaza el número de confianza si supera el cap."""
     return re.sub(
         r'(CONFIANZA\s*:\s*)(\d+)(\s*%)',
         lambda m: m.group(1) + str(min(int(m.group(2)), cap)) + m.group(3),
         text,
         flags=re.IGNORECASE,
     )
+
+
+def _fmt_odds(val):
+    """Formatea una cuota — nunca muestra None."""
+    if val is None:
+        return "N/D"
+    try:
+        return str(round(float(val), 2))
+    except Exception:
+        return "N/D"
 
 
 def generate_pick(
@@ -99,11 +109,11 @@ def generate_pick(
     home_half_season=None, away_half_season=None,
     home_coach=None, away_coach=None,
     match_dow=None,
-    # ── Datos nuevos ──────────────────────────────────────────────────
     home_xg=None, away_xg=None,
     home_odds_range=None, away_odds_range=None,
     referee_info=None, referee_stats=None,
     home_suspensions=None, away_suspensions=None,
+    league_key=None,
 ):
     # ── Helpers ───────────────────────────────────────────────────────
     def standing_str(name, s):
@@ -209,6 +219,38 @@ def generate_pick(
             f"{away_team} {confidence_score.get('away',0):.0f}%"
         )
 
+    # ── Conflicto mercado vs modelo ───────────────────────────────────
+    conflicts = market_vs_model_conflict(poisson_data, odds, league_key)
+    conflict_str = "Sin conflictos detectados entre modelo y mercado"
+    conflict_warning = ""
+    if conflicts:
+        lines = []
+        for c in conflicts:
+            lines.append(
+                f"  {c['severity']} {c['outcome']}: modelo={c['model']}% vs mercado={c['market']}% "
+                f"(diferencia={c['diff']}%) → confiar en {c['trust']}"
+            )
+        conflict_str = "\n".join(lines)
+        max_diff = max(c["diff"] for c in conflicts)
+        if max_diff >= 25:
+            conflict_warning = (
+                f"\n🚨 CONFLICTO GRAVE: El modelo y el mercado difieren en más de {max_diff:.0f}%. "
+                f"Reduce la confianza del pick y prioriza el {'mercado' if conflicts[0]['trust'] == 'mercado' else 'modelo'}."
+            )
+
+    # ── Eficiencia del mercado ────────────────────────────────────────
+    efficiency_label = get_league_efficiency_label(league_key) if league_key else "Liga desconocida — eficiencia del mercado incierta"
+
+    # ── Kelly Criterion ───────────────────────────────────────────────
+    kelly_home = kelly_criterion(poisson_data.get("prob_home_win", 0), odds.get("home_win"))
+    kelly_away = kelly_criterion(poisson_data.get("prob_away_win", 0), odds.get("away_win"))
+    kelly_draw = kelly_criterion(poisson_data.get("prob_draw", 0), odds.get("draw"))
+    kelly_lines = []
+    if kelly_home:  kelly_lines.append(f"  Victoria {home_team}: {kelly_home}% del bankroll")
+    if kelly_draw:  kelly_lines.append(f"  Empate: {kelly_draw}% del bankroll")
+    if kelly_away:  kelly_lines.append(f"  Victoria {away_team}: {kelly_away}% del bankroll")
+    kelly_str = "\n".join(kelly_lines) if kelly_lines else "  Sin ventaja matemática detectada (no apostar)"
+
     # ── Sin estadísticas ──────────────────────────────────────────────
     has_no_stats = not home_stats and not away_stats
     no_stats_warning = ""
@@ -220,16 +262,21 @@ def generate_pick(
         )
 
     # ══════════════════════════════════════════════════════════════════
-    # PROMPT — 6 señales clave priorizadas
+    # PROMPT
     # ══════════════════════════════════════════════════════════════════
     prompt = f"""Eres un experto analista de apuestas deportivas con 20 años de experiencia.
-Analiza el partido y da un pick basándote en las 6 señales clave en orden de importancia.
+Analiza el partido y da un pick basándote en las señales clave en orden de importancia.
 {no_stats_warning}
+{conflict_warning}
 
 === PARTIDO ===
 {home_team} vs {away_team}
 Competición: {competition}
 Día del partido: {match_dow or 'desconocido'}
+
+=== EFICIENCIA DEL MERCADO (IMPORTANTE) ===
+{efficiency_label}
+Esto define cuánto peso darle a las cuotas vs al modelo estadístico.
 
 === TABLA DE POSICIONES ===
 {standing_str(home_team, home_standing)}
@@ -242,30 +289,36 @@ Día del partido: {match_dow or 'desconocido'}
 {coach_str(away_team, away_coach)}
 
 ══════════════════════════════════════
-SEÑAL 1 — MOVIMIENTO DE CUOTAS (la más confiable)
+SEÑAL 1 — CONFLICTO MERCADO VS MODELO (revisar primero)
+══════════════════════════════════════
+{conflict_str}
+Si hay conflicto alto, prioriza el mercado en ligas eficientes y el modelo en ligas poco eficientes.
+
+══════════════════════════════════════
+SEÑAL 2 — MOVIMIENTO DE CUOTAS
 ══════════════════════════════════════
 {movement_str}
 {alert_str}
 Cuotas actuales:
-  1 ({home_team}): {odds.get('home_win','N/A')} | X: {odds.get('draw','N/A')} | 2 ({away_team}): {odds.get('away_win','N/A')}
-  Over 2.5: {odds.get('over_25','N/A')} | Under 2.5: {odds.get('under_25','N/A')}
-  BTTS Sí: {odds.get('btts_yes','N/A')} | BTTS No: {odds.get('btts_no','N/A')}
+  1 ({home_team}): {_fmt_odds(odds.get('home_win'))} | X: {_fmt_odds(odds.get('draw'))} | 2 ({away_team}): {_fmt_odds(odds.get('away_win'))}
+  Over 2.5: {_fmt_odds(odds.get('over_25'))} | Under 2.5: {_fmt_odds(odds.get('under_25'))}
+  BTTS Sí: {_fmt_odds(odds.get('btts_yes'))} | BTTS No: {_fmt_odds(odds.get('btts_no'))}
 
 ══════════════════════════════════════
-SEÑAL 2 — xG (Expected Goals) — calidad real de juego
+SEÑAL 3 — xG (Expected Goals) — calidad real de juego
 ══════════════════════════════════════
 {xg_str(home_team, home_xg)}
 {xg_str(away_team, away_xg)}
 (Si un equipo marca MÁS que su xG, probablemente no lo sostenga. Si marca MENOS, puede mejorar.)
 
 ══════════════════════════════════════
-SEÑAL 3 — RENDIMIENTO COMO FAVORITO / UNDERDOG
+SEÑAL 4 — RENDIMIENTO COMO FAVORITO / UNDERDOG
 ══════════════════════════════════════
 {odds_range_str(home_team, home_odds_range)}
 {odds_range_str(away_team, away_odds_range)}
 
 ══════════════════════════════════════
-SEÑAL 4 — DESCANSO Y FATIGA
+SEÑAL 5 — DESCANSO Y FATIGA
 ══════════════════════════════════════
 {rest_str(home_team, home_days_rest)}
 {rest_str(away_team, away_days_rest)}
@@ -274,12 +327,12 @@ SEÑAL 4 — DESCANSO Y FATIGA
 Racha: {home_team}: {home_streak} | {away_team}: {away_streak}
 
 ══════════════════════════════════════
-SEÑAL 5 — ÁRBITRO DESIGNADO
+SEÑAL 6 — ÁRBITRO DESIGNADO
 ══════════════════════════════════════
 {referee_section}
 
 ══════════════════════════════════════
-SEÑAL 6 — MODELO POISSON (probabilidad matemática)
+SEÑAL 7 — MODELO POISSON (con corrección Dixon-Coles)
 ══════════════════════════════════════
 Goles esperados → {home_team}: {poisson_data.get('lambda_home',0)} | {away_team}: {poisson_data.get('lambda_away',0)}
 Victoria {home_team}: {poisson_data.get('prob_home_win',0)}%
@@ -289,6 +342,12 @@ Over 2.5: {poisson_data.get('prob_over25',0)}% | BTTS: {poisson_data.get('prob_b
 Score más probable: {poisson_data.get('most_likely_score','N/A')}
 Top marcadores:
 {top_scores_str}
+
+══════════════════════════════════════
+KELLY CRITERION (tamaño de apuesta recomendado — 25% Kelly conservador)
+══════════════════════════════════════
+{kelly_str}
+Nota: Estos % son del bankroll total. Si Kelly da 0% o negativo, no hay ventaja matemática.
 
 ══════════════════════════════════════
 DATOS ADICIONALES
@@ -321,21 +380,24 @@ Portería a 0: {away_stats.get('clean_sheets_rate',0)*100:.1f}% | BTTS: {away_st
 {conf_str}
 
 === TU TAREA ===
-Pesa las 6 señales en orden de importancia (movimiento cuotas > xG > rol favorito/underdog > fatiga > árbitro > Poisson).
+Pesa las señales en orden de importancia según la eficiencia del mercado de la liga.
+En ligas muy eficientes (≥85%), prioriza conflicto mercado/modelo y movimiento de cuotas.
+En ligas poco eficientes (<65%), da más peso al modelo Poisson y xG.
+
 Responde EXACTAMENTE en este formato:
 
 🎯 PICK PRINCIPAL: [UNO: "Victoria {home_team}" / "Empate" / "Victoria {away_team}"]
 📊 PICK SECUNDARIO: [UNO: "Over 2.5 goles" / "Under 2.5 goles" / "BTTS Sí" / "BTTS No"]
 ⭐ CONFIANZA: [1-100]%
-💰 CUOTA RECOMENDADA: [cuota del pick principal]
-📝 RAZONAMIENTO: [4-5 líneas mencionando: movimiento de cuotas, xG vs goles reales, rendimiento como favorito/underdog, descanso, árbitro y modelo Poisson]
+💰 CUOTA RECOMENDADA: [cuota del pick principal, número]
+💸 KELLY: [% del bankroll recomendado según Kelly, o "No apostar (sin ventaja)"]
+📝 RAZONAMIENTO: [4-5 líneas: menciona conflicto mercado/modelo, eficiencia de liga, movimiento cuotas, xG, descanso, árbitro y Poisson]
 ⚠️ RIESGO: [Bajo / Medio / Alto]
 
 Solo el análisis, sin saludos."""
 
     result = _call_groq(prompt)
 
-    # FIX C: cap duro de confianza cuando no hay estadísticas históricas
     if has_no_stats and result and not result.startswith("❌"):
         result = _cap_confidence_in_text(result, cap=70)
         logger.info("Cap de confianza 70% aplicado (sin estadísticas históricas)")
