@@ -1102,8 +1102,6 @@ def main():
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
-if __name__ == "__main__":
-    main()
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1492,3 +1490,7 @@ async def daily_bankroll_report_loop(app):
             await _send_daily_bankroll_report(app)
         except Exception as e:
             logger.error(f"Error en daily_bankroll_report_loop: {e}")
+
+
+if __name__ == "__main__":
+    main()
