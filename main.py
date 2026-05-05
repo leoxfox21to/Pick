@@ -21,6 +21,7 @@ from odds_api import (get_all_odds, find_odds_for_match,
                       get_todays_events, get_tomorrows_events,
                       get_odds_for_match_on_demand, get_odds_by_event_id,
                       get_scores_for_sport, get_team_form_from_scores,
+                      get_all_markets_for_event,
                       SOCCER_SPORTS, SPORT_DISPLAY_NAMES)
 from analyzer import (extract_team_stats, poisson_prediction, h2h_stats,
                       calculate_value_bet, calculate_streak, days_since_last_match,
@@ -34,6 +35,11 @@ from ai_pick import generate_pick
 from apifootball import (get_full_match_data as apifb_get_full_match_data,
                          get_team_season_stats as apifb_season_stats,
                          get_coach as apifb_get_coach,
+                         get_fixtures_by_date as apifb_fixtures_by_date,
+                         get_fixture_predictions as apifb_predictions,
+                         get_fixture_lineups as apifb_lineups,
+                         find_fixture_for_pick as apifb_find_fixture,
+                         get_team_injuries_apifb,
                          SPORT_KEY_TO_LEAGUE)
 from weather import get_weather_for_team, format_weather
 from db import (init_db, save_pick, get_history, get_stats as db_get_stats, get_cache_stats,
@@ -141,10 +147,37 @@ async def _load_matches_day(update: Update, context: ContextTypes.DEFAULT_TYPE,
     msg     = await update.message.reply_text(f"⏳ Cargando partidos de {title.lower()}...")
     try:
         fetcher = get_todays_events if offset_days == 0 else get_tomorrows_events
-        matches, all_odds = await asyncio.gather(
+        import datetime as _dtmod
+        _tgt_date = (_dtmod.date.today() + _dtmod.timedelta(days=offset_days)).isoformat()
+        matches, all_odds, _apifb_fx = await asyncio.gather(
             asyncio.to_thread(fetcher),
             asyncio.to_thread(get_all_odds),
+            asyncio.to_thread(apifb_fixtures_by_date, _tgt_date),
         )
+
+        # Merge: agregar partidos de API-Football no cubiertos por Odds API
+        def _tok_overlap(a, b):
+            a, b = a.lower(), b.lower()
+            wa = {w for w in a.split() if len(w) > 3}
+            wb = {w for w in b.split() if len(w) > 3}
+            return bool(wa & wb) or a[:5] in b or b[:5] in a
+
+        def _already_in(home, away, lst):
+            return any(
+                _tok_overlap(home, m.get("homeTeam", {}).get("name", "")) and
+                _tok_overlap(away, m.get("awayTeam", {}).get("name", ""))
+                for m in lst
+            )
+
+        _merged = sum(
+            1 for fx in _apifb_fx
+            if fx.get("status") == "SCHEDULED" and
+               not _already_in(fx.get("homeTeam", {}).get("name", ""),
+                                fx.get("awayTeam", {}).get("name", ""), matches)
+            and matches.append(fx) is None
+        )
+        if _merged:
+            logger.info(f"API-Football merge: +{_merged} partidos extra")
 
         def _cuba_sort_key(m):
             utc_str = m.get("utcDate", "")
@@ -230,6 +263,7 @@ async def _cmd_pick_from_cache(update: Update, context: ContextTypes.DEFAULT_TYP
     competition_code = match.get("competition", {}).get("code") or ""
     sport_key        = match.get("_sport_key")
     odds_event_id    = match.get("_event_id")
+    apifb_fixture_id = match.get("_apifb_fixture_id")
     time_cuba        = utc_to_cuba(match.get("utcDate", ""))
     is_odds_source   = match.get("_source") == "odds"
 
@@ -877,7 +911,9 @@ async def _cmd_pick_from_cache(update: Update, context: ContextTypes.DEFAULT_TYP
             f"{efficiency_str}"
             f"{conflict_str}"
             f"{kelly_str}"
-            f"{value_str}\n\n"
+            f"{value_str}"
+            f"{predictions_str}"
+            f"{expanded_markets_str}\n\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🤖 *ANÁLISIS IA:*\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -893,6 +929,63 @@ async def _cmd_pick_from_cache(update: Update, context: ContextTypes.DEFAULT_TYP
                 f"💰 Ganancia potencial: *${auto_bet_info['potential_win']:.2f}*\n"
                 f"🏦 Balance actual: *${_bal:.2f}*"
             )
+
+        # ── Predicciones API-Football + Mercados extendidos ─────────────
+        if not apifb_fixture_id and league_id_for_extras:
+            apifb_fixture_id = await asyncio.to_thread(
+                apifb_find_fixture, home_name, away_name,
+                league_id_for_extras, match.get("utcDate", "")[:10]
+            )
+        _preds_t   = asyncio.to_thread(apifb_predictions, apifb_fixture_id) if apifb_fixture_id else _empty_dict()
+        _markets_t = asyncio.to_thread(get_all_markets_for_event, sport_key or "", odds_event_id or "") if (sport_key and odds_event_id) else _empty_dict()
+        apifb_preds, expanded_markets = await asyncio.gather(_preds_t, _markets_t)
+
+        # ── String de predicciones ───────────────────────────────────
+        predictions_str = ""
+        if apifb_preds and apifb_preds.get("winner_name"):
+            ph   = apifb_preds.get("percent_home") or "?"
+            pdv  = apifb_preds.get("percent_draw") or "?"
+            pa   = apifb_preds.get("percent_away") or "?"
+            adv  = apifb_preds.get("advice") or ""
+            uo   = apifb_preds.get("under_over") or ""
+            predictions_str = (
+                f"\n\n🤖 *Predicc\. API\-Football:*\n"
+                f"  🏆 Ganador: *{_esc(apifb_preds['winner_name'])}*\n"
+                f"  📊 L {_esc(str(ph))} | E {_esc(str(pdv))} | V {_esc(str(pa))}\n"
+                + (f"  💡 _{_esc(adv)}_\n" if adv else "")
+                + (f"  U/O: {_esc(str(uo))}" if uo else "")
+            )
+
+        # ── String de mercados extendidos ────────────────────────────
+        expanded_markets_str = ""
+        _em_lines = []
+        if expanded_markets.get("handicap_home"):
+            hh = expanded_markets["handicap_home"]
+            ha = expanded_markets.get("handicap_away", {})
+            _em_lines.append(
+                f"  HCP: {_esc(str(hh.get('line','')))} @ {_esc(str(hh.get('odds','N/D')))} | "
+                f"{_esc(str(ha.get('line','')))} @ {_esc(str(ha.get('odds','N/D')))}"
+            )
+        if expanded_markets.get("btts_yes"):
+            _em_lines.append(
+                f"  BTTS: ✅ {_esc(str(expanded_markets['btts_yes']))} | "
+                f"❌ {_esc(str(expanded_markets.get('btts_no','N/D')))}"
+            )
+        if expanded_markets.get("ht_1_home"):
+            _em_lines.append(
+                f"  1er T: {_esc(str(expanded_markets['ht_1_home']))} / "
+                f"{_esc(str(expanded_markets.get('ht_1_draw','?')))} / "
+                f"{_esc(str(expanded_markets.get('ht_1_away','?')))}"
+            )
+        if expanded_markets.get("asian_home"):
+            ah = expanded_markets["asian_home"]
+            aa = expanded_markets.get("asian_away", {})
+            _em_lines.append(
+                f"  Asian HH: {_esc(str(ah.get('line','')))} @ {_esc(str(ah.get('odds','N/D')))} | "
+                f"{_esc(str(aa.get('line','')))} @ {_esc(str(aa.get('odds','N/D')))}"
+            )
+        if _em_lines:
+            expanded_markets_str = "\n\n📈 *Más mercados:*\n" + "\n".join(_em_lines)
 
         analyzed_matches.add(match_id)
         await msg.edit_text(final_text, parse_mode="Markdown")
