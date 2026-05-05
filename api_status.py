@@ -6,25 +6,43 @@ logger = logging.getLogger(__name__)
 
 
 def check_odds_api():
-    key = os.environ.get("ODDS_API_KEY", "").strip()
-    if not key:
-        return {"ok": False, "error": "Sin clave configurada"}
-    try:
-        resp = requests.get(
-            "https://api.the-odds-api.com/v4/sports",
-            params={"apiKey": key},
-            timeout=10,
-        )
-        remaining = resp.headers.get("x-requests-remaining", "?")
-        used      = resp.headers.get("x-requests-used", "?")
-        if resp.status_code == 200:
-            return {"ok": True, "remaining": remaining, "used": used}
-        elif resp.status_code == 401:
-            return {"ok": False, "error": "Clave inválida"}
-        else:
-            return {"ok": False, "error": f"HTTP {resp.status_code}", "remaining": remaining, "used": used}
-    except Exception as e:
-        return {"ok": False, "error": str(e)[:80]}
+    keys = []
+    for i in ["1", "2", "3", "4"]:
+        k = os.environ.get(f"ODDS_API_KEY_{i}", "").strip()
+        if k:
+            keys.append(k)
+    fallback = os.environ.get("ODDS_API_KEY", "").strip()
+    if fallback and fallback not in keys:
+        keys.append(fallback)
+
+    if not keys:
+        return {"ok": False, "error": "Sin clave configurada", "keys": 0}
+
+    results = []
+    for idx, key in enumerate(keys, 1):
+        try:
+            resp = requests.get(
+                "https://api.the-odds-api.com/v4/sports",
+                params={"apiKey": key},
+                timeout=10,
+            )
+            remaining = resp.headers.get("x-requests-remaining", "?")
+            used      = resp.headers.get("x-requests-used", "?")
+            if resp.status_code == 200:
+                try:
+                    rem_int = int(remaining)
+                    bar = " 🟢" if rem_int > 100 else " 🟡" if rem_int > 20 else " 🔴"
+                except Exception:
+                    bar = ""
+                results.append({"key_num": idx, "ok": True, "used": used, "remaining": remaining, "bar": bar})
+            elif resp.status_code == 401:
+                results.append({"key_num": idx, "ok": False, "error": "Clave inválida (401)"})
+            else:
+                results.append({"key_num": idx, "ok": False, "error": f"HTTP {resp.status_code}"})
+        except Exception as e:
+            results.append({"key_num": idx, "ok": False, "error": str(e)[:60]})
+
+    return {"ok": True, "keys": len(keys), "details": results}
 
 
 def check_football_data():
