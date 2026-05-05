@@ -257,6 +257,12 @@ async def _cmd_pick_from_cache(update: Update, context: ContextTypes.DEFAULT_TYP
         home_stand, away_stand = {}, {}
         home_injuries, away_injuries = [], []
 
+        # ── Rastreo de fuentes de datos ──────────────────────────────
+        src_odds_ok         = False   # The Odds API — cuotas reales
+        src_footballdata_ok = False   # football-data.org — historial
+        src_apifootball_ok  = False   # API-Football — historial/stats
+        src_extended_ok     = False   # SofaScore/Extended — historial
+
         if stats_limited:
             await msg.edit_text(
                 f"🔍 Analizando *{home_name}* vs *{away_name}*...\n\n"
@@ -268,6 +274,7 @@ async def _cmd_pick_from_cache(update: Update, context: ContextTypes.DEFAULT_TYP
             )
             if home_matches or away_matches:
                 stats_limited = False
+                src_apifootball_ok = True
                 home_id = apifb_hid or home_id
                 away_id = apifb_aid or away_id
             else:
@@ -277,6 +284,7 @@ async def _cmd_pick_from_cache(update: Update, context: ContextTypes.DEFAULT_TYP
                     away_matches = agg["away_matches"]
                     h2h_raw      = agg["h2h"]
                     stats_limited = False
+                    src_extended_ok = True
                     if agg["home_id"]: home_id = agg["home_id"]
                     if agg["away_id"]: away_id = agg["away_id"]
                 else:
@@ -293,6 +301,8 @@ async def _cmd_pick_from_cache(update: Update, context: ContextTypes.DEFAULT_TYP
                 asyncio.to_thread(get_team_injuries, home_id),
                 asyncio.to_thread(get_team_injuries, away_id),
             )
+            if home_matches or away_matches:
+                src_footballdata_ok = True
         else:
             home_matches, away_matches, h2h_raw, home_stand, away_stand, home_injuries, away_injuries = await asyncio.gather(
                 asyncio.to_thread(get_team_last_matches, home_id, 50),
@@ -303,6 +313,8 @@ async def _cmd_pick_from_cache(update: Update, context: ContextTypes.DEFAULT_TYP
                 asyncio.to_thread(get_team_injuries, home_id),
                 asyncio.to_thread(get_team_injuries, away_id),
             )
+            if home_matches or away_matches:
+                src_footballdata_ok = True
 
         # ── Datos adicionales en paralelo ────────────────────────────
         league_id_for_extras = (
@@ -389,6 +401,7 @@ async def _cmd_pick_from_cache(update: Update, context: ContextTypes.DEFAULT_TYP
             odds = find_odds_for_match(home_name, away_name, all_odds) or {}
         if not odds and sport_key:
             odds = await asyncio.to_thread(get_odds_for_match_on_demand, sport_key, home_name, away_name) or {}
+        src_odds_ok = bool(odds.get("home_win") and odds.get("draw") and odds.get("away_win"))
 
         # ── Rendimiento según cuota actual ───────────────────────────
         home_odds_range = odds_range_performance(home_matches, home_id, odds.get("home_win"), True)  if home_matches and home_id else {}
@@ -735,6 +748,18 @@ async def _cmd_pick_from_cache(update: Update, context: ContextTypes.DEFAULT_TYP
         if ht_lines:
             ht_str = "\n⏱️ *Por mitad (promedio):*\n" + "\n".join(ht_lines)
 
+        # ── Línea de fuentes usadas ──────────────────────────────────
+        _ok = "✅"
+        _no = "❌"
+        _sources_total = sum([src_odds_ok, src_footballdata_ok, src_apifootball_ok, src_extended_ok])
+        fuentes_str = (
+            f"\n📡 *Fuentes: {_sources_total}/4* — "
+            f"Odds API {_ok if src_odds_ok else _no} | "
+            f"football\\-data {_ok if src_footballdata_ok else _no} | "
+            f"API\\-Football {_ok if src_apifootball_ok else _no} | "
+            f"SofaScore {_ok if src_extended_ok else _no}"
+        )
+
         if stats_limited:
             if stats_source_note == "SIN_COBERTURA":
                 limited_note = (
@@ -773,6 +798,7 @@ async def _cmd_pick_from_cache(update: Update, context: ContextTypes.DEFAULT_TYP
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"⚽ *{home_name}* vs *{away_name}*\n"
             f"🏆 {competition} | 🕐 {time_cuba}"
+            f"{fuentes_str}"
             f"{limited_note}\n"
             f"━━━━━━━━━━━━━━━━━━━━"
             f"{tabla_str}"
