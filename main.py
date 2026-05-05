@@ -41,19 +41,17 @@ from apifootball import (get_full_match_data as apifb_get_full_match_data,
                          find_fixture_for_pick as apifb_find_fixture,
                          get_team_injuries_apifb,
                          SPORT_KEY_TO_LEAGUE)
-from weather import get_weather_for_team, format_weather
-from db import (init_db, save_pick, get_history, get_stats as db_get_stats, get_cache_stats,
+from db import (init_db, save_pick, get_history, get_stats as db_get_stats,
                 get_pending_picks, update_pick_result, parse_ai_pick,
                 name_matches, determine_correct,
                 subscribe, unsubscribe, is_subscribed, get_active_subscribers,
                 mark_alert_sent, alert_already_sent,
                 save_match_to_cache, get_team_matches_from_cache,
-                get_stats_by_league, get_calibration_stats, save_closing_odds,
+                get_stats_by_league,
                 place_auto_bet, resolve_auto_bets_for_pick,
                 get_balance, get_bankroll_summary, get_bankroll_history,
                 get_today_total_staked, get_rendimiento_stats)
-from odds_tracker import save_odds_snapshot, get_odds_movement, get_closing_odds, calculate_clv, get_clv_label
-from api_status import check_odds_api, check_football_data, check_apifootball, check_groq
+from odds_tracker import save_odds_snapshot, get_odds_movement
 from data_aggregator import get_extended_match_data
 from referee import get_match_referee, get_referee_stats, format_referee_for_telegram
 from suspensions import get_suspension_risks, format_suspensions
@@ -405,12 +403,10 @@ async def _cmd_pick_from_cache(update: Update, context: ContextTypes.DEFAULT_TYP
             match.get("competition", {}).get("id")
             or SPORT_KEY_TO_LEAGUE.get(sport_key or "")
         )
-        (weather_data,
-         ref_info,
+        (ref_info,
          home_season_stats, away_season_stats,
          home_coach_info, away_coach_info,
          home_susp, away_susp) = await asyncio.gather(
-            asyncio.to_thread(get_weather_for_team, home_name),
             asyncio.to_thread(get_match_referee, home_name, away_name),
             asyncio.to_thread(apifb_season_stats, home_id, league_id_for_extras) if (home_id and league_id_for_extras) else _empty_dict(),
             asyncio.to_thread(apifb_season_stats, away_id, league_id_for_extras) if (away_id and league_id_for_extras) else _empty_dict(),
@@ -602,7 +598,6 @@ async def _cmd_pick_from_cache(update: Update, context: ContextTypes.DEFAULT_TYP
             home_days_rest, away_days_rest,
             confidence_score,
             home_season_stats, away_season_stats,
-            weather_data,
             home_ht, away_ht,
             home_dow, away_dow,
             home_night, away_night,
@@ -626,12 +621,6 @@ async def _cmd_pick_from_cache(update: Update, context: ContextTypes.DEFAULT_TYP
             home_odds=odds.get("home_win"), draw_odds=odds.get("draw"), away_odds=odds.get("away_win"),
             sport_key=sport_key, odds_event_id=odds_event_id, match_date=match.get("utcDate", "")[:10],
         )
-        # Guardar CLV inicial si tenemos odds_event_id (para comparar al cierre)
-        if pick_id and odds_event_id:
-            closing = get_closing_odds(odds_event_id)
-            if closing and closing.get("home_win"):
-                save_closing_odds(pick_id, closing.get("home_win"), closing.get("draw"), closing.get("away_win"))
-
         # ── Kelly (calculado aquí para poder usarlo en auto-bet) ────
         kelly_h = kelly_criterion(poisson_data.get("prob_home_win", 0), odds.get("home_win"))
         kelly_d = kelly_criterion(poisson_data.get("prob_draw", 0),     odds.get("draw"))
@@ -826,8 +815,6 @@ async def _cmd_pick_from_cache(update: Update, context: ContextTypes.DEFAULT_TYP
         efficiency_str = f"\n📡 *{eff_label}*" if sport_key else ""
 
         injuries_str = format_injuries(home_injuries, home_name) + format_injuries(away_injuries, away_name)
-        weather_str  = format_weather(weather_data)
-
         coach_str = ""
         if home_coach_info or away_coach_info:
             def _cl(name, c):
@@ -978,7 +965,6 @@ async def _cmd_pick_from_cache(update: Update, context: ContextTypes.DEFAULT_TYP
             f"{referee_str}"
             f"{susp_str}"
             f"{injuries_str}"
-            f"{weather_str}"
             f"{xg_str}"
             f"{role_str}"
             f"{ht_str}"
@@ -1061,14 +1047,8 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     acc      = stats.get("accuracy", 0)
     hc_acc   = stats.get("hc_accuracy", 0)
-    clv_avg  = stats.get("clv_avg")
     acc_icon = "🔥" if acc >= 65 else "📊" if acc >= 50 else "📉"
     hc_icon  = "🔥" if hc_acc >= 70 else "📊" if hc_acc >= 55 else "📉"
-
-    clv_line = ""
-    if clv_avg is not None:
-        clv_icon = "📈" if clv_avg > 1 else "➡️" if clv_avg >= -1 else "⚠️"
-        clv_line = f"\n{clv_icon} *CLV promedio: {clv_avg:+.2f}%* ({'picks inteligentes' if clv_avg > 0 else 'mejorar selección'})"
 
     text = (
         f"📈 *ESTADÍSTICAS DE PICKS*\n"
@@ -1079,31 +1059,9 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"⏳ Pendientes: {stats['pending']}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"{acc_icon} *Acierto general: {acc}%*\n"
-        f"{hc_icon} *Alta confianza (≥70%): {hc_acc}%* ({stats['hc_correct']}/{stats['hc_total']})"
-        f"{clv_line}\n"
+        f"{hc_icon} *Alta confianza (≥70%): {hc_acc}%* ({stats['hc_correct']}/{stats['hc_total']})\n"
         f"━━━━━━━━━━━━━━━━━━━━"
     )
-
-    # Calibración de confianza
-    calib = get_calibration_stats()
-    if calib:
-        calib_lines = ["\n\n🎯 *CALIBRACIÓN (confianza declarada vs acierto real):*"]
-        for row in calib:
-            bucket   = row.get("bucket", "?")
-            real_acc = row.get("real_accuracy")
-            total_b  = row.get("total", 0)
-            correct_b = row.get("correct", 0)
-            if real_acc is None:
-                continue
-            bucket_mid = int(bucket.split("-")[0].replace("%+", "").replace("%", ""))
-            diff = real_acc - bucket_mid
-            cal_icon = "✅" if abs(diff) <= 8 else ("📈" if diff > 0 else "📉")
-            calib_lines.append(
-                f"  {cal_icon} {bucket}: declaré ~{bucket_mid}% → acerté *{real_acc}%* ({correct_b}/{total_b})"
-            )
-        if len(calib_lines) > 1:
-            calib_lines.append("_✅=bien calibrado | 📈=subestimado | 📉=sobreconfiado_")
-            text += "\n".join(calib_lines)
 
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -1316,208 +1274,6 @@ async def post_init(app):
     logger.info("Loops de resultados, alertas, movimiento de línea y bankroll iniciados.")
 
 
-async def cmd_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("🔄 Verificando APIs...")
-
-    odds, fd, apifb, groq = await asyncio.gather(
-        asyncio.to_thread(check_odds_api),
-        asyncio.to_thread(check_football_data),
-        asyncio.to_thread(check_apifootball),
-        asyncio.to_thread(check_groq),
-    )
-
-    lines = ["📡 <b>ESTADO DE APIs</b>\n"]
-
-    # ── The Odds API ──────────────────────────────────────────────────
-    lines.append("🎲 <b>The Odds API</b>")
-    if not odds.get("ok") and odds.get("keys", 0) == 0:
-        lines.append(f"  ❌ {odds.get('error', 'Sin clave configurada')}")
-    else:
-        lines.append(f"  🔑 {odds.get('keys', 0)} clave(s)")
-        for d in odds.get("details", []):
-            if d.get("ok"):
-                lines.append(f"  ✅ Key {d['key_num']}: Usadas: {d.get('used','?')} | Restantes: {d.get('remaining','?')}{d.get('bar','')}")
-            else:
-                lines.append(f"  ❌ Key {d['key_num']}: {d.get('error','?')}")
-    lines.append("")
-
-    # ── football-data.org ─────────────────────────────────────────────
-    lines.append("⚽ <b>football-data.org</b>")
-    if not fd.get("ok") and fd.get("keys", 0) == 0:
-        lines.append("  ❌ Sin clave configurada")
-    else:
-        lines.append(f"  🔑 {fd.get('keys', 0)} clave(s)")
-        for d in fd.get("details", []):
-            if d.get("ok"):
-                lines.append(
-                    f"  ✅ Key {d['key_num']}: {d.get('available_minute','?')} req/min disponibles"
-                )
-            else:
-                lines.append(f"  ❌ Key {d['key_num']}: {d.get('error','?')}")
-    lines.append("")
-
-    # ── API-Football ──────────────────────────────────────────────────
-    lines.append("🏟️ <b>API-Football (api-sports.io)</b>")
-    if not apifb.get("ok") and apifb.get("keys", 0) == 0:
-        lines.append("  ❌ Sin clave configurada")
-    else:
-        lines.append(f"  🔑 {apifb.get('keys', 0)} clave(s)")
-        for d in apifb.get("details", []):
-            if d.get("ok"):
-                remaining = d.get("remaining", "?")
-                bar = ""
-                if isinstance(remaining, int) and isinstance(d.get("limit"), int):
-                    pct = remaining / d["limit"]
-                    bar = " 🟢" if pct > 0.3 else " 🟡" if pct > 0.1 else " 🔴"
-                lines.append(
-                    f"  ✅ Key {d['key_num']}: {d.get('used','?')}/{d.get('limit','?')} usadas | "
-                    f"Restantes: {remaining}{bar}"
-                )
-            else:
-                lines.append(f"  ❌ Key {d['key_num']}: {d.get('error','?')}")
-    lines.append("")
-
-    # ── Groq ──────────────────────────────────────────────────────────
-    lines.append("🤖 <b>Groq (IA / LLaMA)</b>")
-    if not groq.get("ok") and groq.get("keys", 0) == 0:
-        lines.append("  ❌ Sin clave configurada")
-    else:
-        lines.append(f"  🔑 {groq.get('keys', 0)} clave(s)")
-        for d in groq.get("details", []):
-            if d.get("ok"):
-                lines.append(f"  ✅ Key {d['key_num']}: Activa")
-            else:
-                lines.append(f"  ❌ Key {d['key_num']}: {d.get('error','?')}")
-
-    await msg.edit_text("\n".join(lines), parse_mode="HTML")
-
-
-async def cmd_fuentes(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Muestra la cobertura de cada API por liga."""
-
-    # Ligas cubiertas por football-data.org (historial completo gratuito)
-    FD_COVERED = {
-        "soccer_epl", "soccer_efl_champ", "soccer_england_efl_champ",
-        "soccer_england_league1", "soccer_england_league2", "soccer_fa_cup",
-        "soccer_germany_bundesliga", "soccer_germany_bundesliga2", "soccer_germany_dfb_pokal",
-        "soccer_italy_serie_a", "soccer_italy_coppa_italia",
-        "soccer_france_ligue_one", "soccer_france_ligue_two", "soccer_france_coupe_de_france",
-        "soccer_spain_la_liga", "soccer_spain_segunda_division",
-        "soccer_portugal_primeira_liga", "soccer_netherlands_eredivisie",
-        "soccer_belgium_first_div",
-        "soccer_uefa_champs_league", "soccer_uefa_europa_league", "soccer_uefa_europa_conference_league",
-        "soccer_brazil_campeonato", "soccer_argentina_primera_division",
-        "soccer_conmebol_copa_libertadores",
-    }
-
-    REGIONS = [
-        ("🏴󠁧󠁢󠁥󠁮󠁧󠁿 Inglaterra", [
-            "soccer_epl", "soccer_efl_champ", "soccer_england_league1",
-            "soccer_england_league2", "soccer_fa_cup",
-        ]),
-        ("🇩🇪 Alemania", [
-            "soccer_germany_bundesliga", "soccer_germany_bundesliga2",
-            "soccer_germany_liga3", "soccer_germany_dfb_pokal",
-        ]),
-        ("🇮🇹 Italia", [
-            "soccer_italy_serie_a", "soccer_italy_serie_b", "soccer_italy_coppa_italia",
-        ]),
-        ("🇫🇷 Francia", [
-            "soccer_france_ligue_one", "soccer_france_ligue_two", "soccer_france_coupe_de_france",
-        ]),
-        ("🇪🇸 España", [
-            "soccer_spain_la_liga", "soccer_spain_segunda_division",
-        ]),
-        ("🌍 Copas Europa", [
-            "soccer_uefa_champs_league", "soccer_uefa_europa_league",
-            "soccer_uefa_europa_conference_league",
-        ]),
-        ("🇵🇹🇳🇱 Portugal / Países Bajos", [
-            "soccer_portugal_primeira_liga", "soccer_netherlands_eredivisie",
-        ]),
-        ("🌍 Otras Europa", [
-            "soccer_austria_bundesliga", "soccer_belgium_first_div",
-            "soccer_denmark_superliga", "soccer_finland_veikkausliiga",
-            "soccer_greece_super_league", "soccer_league_of_ireland",
-            "soccer_norway_eliteserien", "soccer_poland_ekstraklasa",
-            "soccer_russia_premier_league", "soccer_spl",
-            "soccer_sweden_allsvenskan", "soccer_sweden_superettan",
-            "soccer_switzerland_superleague", "soccer_turkey_super_league",
-        ]),
-        ("🌎 Sudamérica", [
-            "soccer_argentina_primera_division",
-            "soccer_brazil_campeonato", "soccer_brazil_serie_b",
-            "soccer_chile_campeonato", "soccer_colombia_primera_a",
-            "soccer_ecuador_liga_pro", "soccer_peru_primera_division",
-            "soccer_uruguay_primera_division", "soccer_venezuela_primera",
-            "soccer_conmebol_copa_libertadores", "soccer_conmebol_copa_sudamericana",
-        ]),
-        ("🌎 CONCACAF", [
-            "soccer_usa_mls", "soccer_mexico_ligamx",
-        ]),
-        ("🌏 Asia / Oceanía / Medio Oriente", [
-            "soccer_australia_aleague", "soccer_china_superleague",
-            "soccer_japan_j_league", "soccer_korea_kleague1",
-            "soccer_saudi_arabia_pro_league",
-        ]),
-    ]
-
-    # Leyenda
-    msg1 = (
-        "<b>📡 COBERTURA DE FUENTES POR LIGA</b>\n\n"
-        "<b>Nivel de datos en cada pick:</b>\n"
-        "🟢 Cuotas + Historial completo (football-data)\n"
-        "🟡 Cuotas + Estadísticas (API-Football)\n"
-        "🔵 Solo cuotas (sin historial)\n"
-        "❌ Sin cobertura (pick con datos mínimos)\n\n"
-        "<b>Fuentes:</b> 🎲=Odds API  📊=football-data  🏟️=API-Football\n"
-        "──────────────────────────\n"
-    )
-
-    blocks = []
-    for region_name, keys in REGIONS:
-        lines = [f"\n<b>{region_name}</b>"]
-        for key in keys:
-            name = SPORT_DISPLAY_NAMES.get(key, key)
-            has_odds = key in SOCCER_SPORTS
-            has_fd   = key in FD_COVERED
-            has_af   = key in SPORT_KEY_TO_LEAGUE
-            if has_odds and has_fd and has_af:
-                icon = "🟢"
-                srcs = "🎲📊🏟️"
-            elif has_odds and has_af:
-                icon = "🟡"
-                srcs = "🎲🏟️"
-            elif has_odds:
-                icon = "🔵"
-                srcs = "🎲"
-            else:
-                icon = "❌"
-                srcs = "—"
-            lines.append(f"  {icon} {name} <i>{srcs}</i>")
-        blocks.append("\n".join(lines))
-
-    # Sin cobertura conocida
-    no_cover = (
-        "\n<b>❌ Ligas sin cobertura en APIs</b>\n"
-        "  ❌ Primera Nacional ARG (2ª div)\n"
-        "  ❌ Ascenso MX (2ª div México)\n"
-        "  ❌ TAS (2ª div Argentina)\n"
-        "  ❌ Ligas regionales / amateur\n"
-        "  <i>→ Picks con 0-1/4 fuentes, usar con precaución</i>"
-    )
-    blocks.append(no_cover)
-
-    full_body = "\n".join(blocks)
-
-    # Telegram tiene límite de 4096 chars — dividir si es necesario
-    max_len = 4000
-    full_text = msg1 + full_body
-    if len(full_text) <= max_len:
-        await update.message.reply_text(full_text, parse_mode="HTML")
-    else:
-        await update.message.reply_text(msg1 + "\n".join(blocks[:5]), parse_mode="HTML")
-        await update.message.reply_text("\n".join(blocks[5:]), parse_mode="HTML")
 
 
 def main():
@@ -1543,9 +1299,6 @@ def main():
     app.add_handler(CommandHandler("combinadas",  cmd_combinadas))
     app.add_handler(CommandHandler("rendimiento", cmd_rendimiento))
     app.add_handler(CommandHandler("bankroll",    cmd_bankroll))
-    app.add_handler(CommandHandler("api",         cmd_api))
-    app.add_handler(CommandHandler("fuentes",     cmd_fuentes))
-    app.add_handler(CommandHandler("cachestats",  cmd_cachestats))
     logger.info("Bot iniciado con todos los módulos activos.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
@@ -1587,52 +1340,6 @@ async def _notify_bet_resolved(app, pick: dict, resolved_bets: list,
 # ══════════════════════════════════════════════════════════════════════════
 # COMANDO /combinadas — Mejores 2-3 picks del día
 # ══════════════════════════════════════════════════════════════════════════
-
-async def cmd_cachestats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Muestra estadisticas del cache local de partidos historicos."""
-    msg = await update.message.reply_text("⏳ Consultando cache local...")
-    try:
-        stats = get_cache_stats()
-        total = stats.get("total", 0)
-        by_league = stats.get("by_league", [])
-        by_source = stats.get("by_source", [])
-        oldest = stats.get("oldest") or "—"
-        newest = stats.get("newest") or "—"
-
-        lines = ["🗄 <b>CACHE LOCAL DE PARTIDOS</b>\n"]
-        lines.append(f"📦 <b>Total partidos acumulados:</b> {total:,}")
-        lines.append(f"📅 Rango: {oldest} → {newest}\n")
-
-        if by_source:
-            lines.append("📡 <b>Por fuente:</b>")
-            src_icons = {
-                "odds_scores": "🎯 Odds API Scores",
-                "auto":        "⚙️  Auto (bot)",
-                "sofascore":   "📊 SofaScore",
-                "espn":        "🏈 ESPN",
-                "local_cache": "💾 Cache",
-            }
-            for s in by_source:
-                src_name = src_icons.get(s["source"], s["source"])
-                lines.append(f"  {src_name}: <b>{s['total']:,}</b>")
-
-        if total == 0:
-            lines.append("\n⚠️ El cache esta vacio.")
-            lines.append("Analiza picks con /pick para ir acumulando historial.")
-            lines.append("Las ligas sin datos (K League, MLS, etc.)")
-            lines.append("se guardan automaticamente al analizar picks.")
-        else:
-            lines.append(f"\n🏆 <b>Top ligas con mas historial:</b>")
-            for entry in by_league[:15]:
-                comp = _esc(entry["competition"])
-                lines.append(f"  • {comp}: <b>{entry['total']}</b> partidos")
-            if len(by_league) > 15:
-                lines.append(f"  <i>... y {len(by_league) - 15} ligas mas</i>")
-
-        await msg.edit_text("\n".join(lines), parse_mode="HTML")
-    except Exception as e:
-        await msg.edit_text(f"❌ Error: <code>{_esc(str(e)[:150])}</code>", parse_mode="HTML")
-
 
 async def cmd_combinadas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Detecta los 2-3 partidos del día con mayor señal y arma una combinada."""
