@@ -524,6 +524,11 @@ async def _cmd_pick_from_cache(update: Update, context: ContextTypes.DEFAULT_TYP
             if closing and closing.get("home_win"):
                 save_closing_odds(pick_id, closing.get("home_win"), closing.get("draw"), closing.get("away_win"))
 
+        # ── Kelly (calculado aquí para poder usarlo en auto-bet) ────
+        kelly_h = kelly_criterion(poisson_data.get("prob_home_win", 0), odds.get("home_win"))
+        kelly_d = kelly_criterion(poisson_data.get("prob_draw", 0),     odds.get("draw"))
+        kelly_a = kelly_criterion(poisson_data.get("prob_away_win", 0), odds.get("away_win"))
+
         # ── Auto-bet bankroll autónomo ───────────────────────────────
         auto_bet_info = None
         if pick_id and parsed.get("confidence", 0) and (parsed.get("confidence", 0) >= 58):
@@ -687,11 +692,8 @@ async def _cmd_pick_from_cache(update: Update, context: ContextTypes.DEFAULT_TYP
                 and _prob_thresholds.get(best_value[0], 0) >= 25):
             value_str = f"\n💎 *Valor detectado:* {best_value[0]} (+{best_value[1]:.1f}% EV)"
 
-        # Kelly Criterion
+        # Kelly Criterion (kelly_h/d/a ya calculados arriba antes del auto-bet)
         kelly_str = ""
-        kelly_h = kelly_criterion(poisson_data.get("prob_home_win", 0), odds.get("home_win"))
-        kelly_d = kelly_criterion(poisson_data.get("prob_draw", 0),     odds.get("draw"))
-        kelly_a = kelly_criterion(poisson_data.get("prob_away_win", 0), odds.get("away_win"))
         k_parts = []
         if kelly_h: k_parts.append(f"{home_name}: {kelly_h}% bankroll")
         if kelly_d: k_parts.append(f"Empate: {kelly_d}% bankroll")
