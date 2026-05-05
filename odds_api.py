@@ -10,7 +10,8 @@ logger = logging.getLogger(__name__)
 
 BASE_URL = "https://api.the-odds-api.com/v4"
 
-_odds_key_index = 0
+_odds_daily_usage = {}
+_odds_reset_date   = None
 
 def _load_odds_keys():
     keys = []
@@ -24,13 +25,26 @@ def _load_odds_keys():
     return keys
 
 def _next_odds_key():
-    global _odds_key_index
+    """Rotacion SECUENCIAL: agota key1 -> key2 -> key3. Limite 450 req/dia."""
+    global _odds_daily_usage, _odds_reset_date
+    today = datetime.now(timezone.utc).date().isoformat()
+    if _odds_reset_date != today:
+        _odds_daily_usage = {}
+        _odds_reset_date = today
     keys = _load_odds_keys()
     if not keys:
         return ""
-    key = keys[_odds_key_index % len(keys)]
-    _odds_key_index = (_odds_key_index + 1) % len(keys)
-    return key
+    LIMIT = 450
+    for key in keys:
+        kp = key[-8:]
+        used = _odds_daily_usage.get(kp, 0)
+        if used < LIMIT:
+            _odds_daily_usage[kp] = used + 1
+            return key
+    logger.warning("Odds API: todas las keys agotadas hoy, usando ultima")
+    kp = keys[-1][-8:]
+    _odds_daily_usage[kp] = _odds_daily_usage.get(kp, 0) + 1
+    return keys[-1]
 
 # Zona horaria Cuba (UTC-4) — se usa para determinar "hoy" y "mañana"
 CUBA_TZ = timezone(timedelta(hours=-4))
