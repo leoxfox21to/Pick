@@ -9,7 +9,28 @@ from datetime import date, datetime, timedelta, timezone
 logger = logging.getLogger(__name__)
 
 BASE_URL = "https://api.the-odds-api.com/v4"
-API_KEY = os.environ.get("ODDS_API_KEY", "")
+
+_odds_key_index = 0
+
+def _load_odds_keys():
+    keys = []
+    for i in ["1", "2", "3", "4"]:
+        k = os.environ.get(f"ODDS_API_KEY_{i}", "").strip()
+        if k:
+            keys.append(k)
+    fallback = os.environ.get("ODDS_API_KEY", "").strip()
+    if fallback and fallback not in keys:
+        keys.append(fallback)
+    return keys
+
+def _next_odds_key():
+    global _odds_key_index
+    keys = _load_odds_keys()
+    if not keys:
+        return ""
+    key = keys[_odds_key_index % len(keys)]
+    _odds_key_index = (_odds_key_index + 1) % len(keys)
+    return key
 
 # Zona horaria Cuba (UTC-4) — se usa para determinar "hoy" y "mañana"
 CUBA_TZ = timezone(timedelta(hours=-4))
@@ -182,7 +203,7 @@ def _get_events_for_day(offset_days: int = 0) -> list:
         try:
             url = f"{BASE_URL}/sports/{sport_key}/events"
             params = {
-                "apiKey": API_KEY,
+                "apiKey": _next_odds_key(),
                 "dateFormat": "iso",
                 "commenceTimeFrom": start_str,
                 "commenceTimeTo": end_str,
@@ -217,8 +238,7 @@ def _get_events_for_day(offset_days: int = 0) -> list:
             elif resp.status_code == 422:
                 pass
             elif resp.status_code == 401:
-                logger.error("ODDS_API_KEY inválida o no configurada")
-                break
+                logger.warning(f"ODDS_API_KEY inválida para {sport_key}, rotando...")
             else:
                 logger.debug(f"odds events {sport_key}: {resp.status_code}")
         except Exception as e:
@@ -253,7 +273,7 @@ def get_all_odds():
         try:
             url = f"{BASE_URL}/sports/{sport}/odds"
             params = {
-                "apiKey": API_KEY,
+                "apiKey": _next_odds_key(),
                 "regions": "eu,uk",
                 "markets": "h2h,totals,btts",
                 "oddsFormat": "decimal",
@@ -264,8 +284,7 @@ def get_all_odds():
                 games = resp.json()
                 all_odds.extend(games)
             elif resp.status_code == 401:
-                logger.error("ODDS_API_KEY inválida o no configurada")
-                break
+                logger.warning("ODDS_API_KEY inválida, rotando a siguiente...")
         except Exception:
             continue
 
@@ -278,7 +297,7 @@ def get_odds_for_match_on_demand(sport_key, home_team, away_team):
     try:
         url = f"{BASE_URL}/sports/{sport_key}/odds"
         params = {
-            "apiKey": API_KEY,
+            "apiKey": _next_odds_key(),
             "regions": "eu,uk",
             "markets": "h2h,totals,btts",
             "oddsFormat": "decimal",
@@ -297,7 +316,7 @@ def get_scores_for_sport(sport_key, days_from=1):
     try:
         url = f"{BASE_URL}/sports/{sport_key}/scores"
         params = {
-            "apiKey": API_KEY,
+            "apiKey": _next_odds_key(),
             "daysFrom": days_from,
             "dateFormat": "iso",
         }
@@ -466,12 +485,13 @@ def _name_similarity(a, b):
 
 def get_odds_by_event_id(sport_key, event_id):
     """Obtiene cuotas directamente por ID de evento — método más confiable."""
-    if not API_KEY or not event_id or not sport_key:
+    keys = _load_odds_keys()
+    if not keys or not event_id or not sport_key:
         return None
     try:
         url = f"{BASE_URL}/sports/{sport_key}/events/{event_id}/odds"
         params = {
-            "apiKey": API_KEY,
+            "apiKey": _next_odds_key(),
             "regions": "eu,uk",
             "markets": "h2h,totals,btts",
             "oddsFormat": "decimal",
