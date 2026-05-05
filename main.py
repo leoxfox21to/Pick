@@ -71,6 +71,14 @@ def utc_to_cuba(utc_str):
         return utc_str[:16]
 
 
+def _esc(text):
+    """Escapa caracteres especiales de Markdown de Telegram en texto variable."""
+    if not text:
+        return ""
+    # En modo Markdown legacy, los problemáticos son: _ * ` [
+    return str(text).replace("_", "\\_").replace("*", "\\*").replace("`", "\\`").replace("[", "\\[")
+
+
 def format_match_list(matches, title="HOY"):
     if not matches:
         return (
@@ -80,9 +88,9 @@ def format_match_list(matches, title="HOY"):
     emoji = "🌅" if title == "MAÑANA" else "⚽"
     lines = [f"{emoji} *PARTIDOS {title}* 🇨🇺\n"]
     for i, m in enumerate(matches, 1):
-        home     = m.get("homeTeam", {}).get("shortName") or m.get("homeTeam", {}).get("name", "?")
-        away     = m.get("awayTeam", {}).get("shortName") or m.get("awayTeam", {}).get("name", "?")
-        comp     = m.get("competition", {}).get("name") or ""
+        home     = _esc(m.get("homeTeam", {}).get("shortName") or m.get("homeTeam", {}).get("name", "?"))
+        away     = _esc(m.get("awayTeam", {}).get("shortName") or m.get("awayTeam", {}).get("name", "?"))
+        comp     = _esc(m.get("competition", {}).get("name") or "")
         time_cuba = utc_to_cuba(m.get("utcDate", ""))
         status   = m.get("status", "")
         done     = "✅ " if m.get("id") in analyzed_matches else ""
@@ -93,8 +101,8 @@ def format_match_list(matches, title="HOY"):
         lines.append(f"`{i:2d}.` {done}*{home}* vs *{away}*")
         lines.append(f"    🏆 {comp} | {status_icon}")
         lines.append("")
-    cmd = "/pick" if title == "HOY" else "/pick_manana"
-    lines.append(f"_{cmd} <número> para analizar un partido_")
+    cmd = "/pick" if title == "HOY" else "/pick\\_manana"
+    lines.append(f"_{cmd} \\<número\\> para analizar un partido_")
     return "\n".join(lines)
 
 
