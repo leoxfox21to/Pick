@@ -20,7 +20,8 @@ from football_api import get_team_last_matches, get_head_to_head, get_team_stand
 from odds_api import (get_all_odds, find_odds_for_match,
                       get_todays_events, get_tomorrows_events,
                       get_odds_for_match_on_demand, get_odds_by_event_id,
-                      get_scores_for_sport, get_team_form_from_scores)
+                      get_scores_for_sport, get_team_form_from_scores,
+                      SOCCER_SPORTS, SPORT_DISPLAY_NAMES)
 from analyzer import (extract_team_stats, poisson_prediction, h2h_stats,
                       calculate_value_bet, calculate_streak, days_since_last_match,
                       calculate_confidence_score, halftime_stats, day_of_week_stats,
@@ -1221,6 +1222,134 @@ async def cmd_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.edit_text("\n".join(lines), parse_mode="HTML")
 
 
+async def cmd_fuentes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Muestra la cobertura de cada API por liga."""
+
+    # Ligas cubiertas por football-data.org (historial completo gratuito)
+    FD_COVERED = {
+        "soccer_epl", "soccer_efl_champ", "soccer_england_efl_champ",
+        "soccer_england_league1", "soccer_england_league2", "soccer_fa_cup",
+        "soccer_germany_bundesliga", "soccer_germany_bundesliga2", "soccer_germany_dfb_pokal",
+        "soccer_italy_serie_a", "soccer_italy_coppa_italia",
+        "soccer_france_ligue_one", "soccer_france_ligue_two", "soccer_france_coupe_de_france",
+        "soccer_spain_la_liga", "soccer_spain_segunda_division",
+        "soccer_portugal_primeira_liga", "soccer_netherlands_eredivisie",
+        "soccer_belgium_first_div",
+        "soccer_uefa_champs_league", "soccer_uefa_europa_league", "soccer_uefa_europa_conference_league",
+        "soccer_brazil_campeonato", "soccer_argentina_primera_division",
+        "soccer_conmebol_copa_libertadores",
+    }
+
+    REGIONS = [
+        ("🏴󠁧󠁢󠁥󠁮󠁧󠁿 Inglaterra", [
+            "soccer_epl", "soccer_efl_champ", "soccer_england_league1",
+            "soccer_england_league2", "soccer_fa_cup",
+        ]),
+        ("🇩🇪 Alemania", [
+            "soccer_germany_bundesliga", "soccer_germany_bundesliga2",
+            "soccer_germany_liga3", "soccer_germany_dfb_pokal",
+        ]),
+        ("🇮🇹 Italia", [
+            "soccer_italy_serie_a", "soccer_italy_serie_b", "soccer_italy_coppa_italia",
+        ]),
+        ("🇫🇷 Francia", [
+            "soccer_france_ligue_one", "soccer_france_ligue_two", "soccer_france_coupe_de_france",
+        ]),
+        ("🇪🇸 España", [
+            "soccer_spain_la_liga", "soccer_spain_segunda_division",
+        ]),
+        ("🌍 Copas Europa", [
+            "soccer_uefa_champs_league", "soccer_uefa_europa_league",
+            "soccer_uefa_europa_conference_league",
+        ]),
+        ("🇵🇹🇳🇱 Portugal / Países Bajos", [
+            "soccer_portugal_primeira_liga", "soccer_netherlands_eredivisie",
+        ]),
+        ("🌍 Otras Europa", [
+            "soccer_austria_bundesliga", "soccer_belgium_first_div",
+            "soccer_denmark_superliga", "soccer_finland_veikkausliiga",
+            "soccer_greece_super_league", "soccer_league_of_ireland",
+            "soccer_norway_eliteserien", "soccer_poland_ekstraklasa",
+            "soccer_russia_premier_league", "soccer_spl",
+            "soccer_sweden_allsvenskan", "soccer_sweden_superettan",
+            "soccer_switzerland_superleague", "soccer_turkey_super_league",
+        ]),
+        ("🌎 Sudamérica", [
+            "soccer_argentina_primera_division",
+            "soccer_brazil_campeonato", "soccer_brazil_serie_b",
+            "soccer_chile_campeonato", "soccer_colombia_primera_a",
+            "soccer_ecuador_liga_pro", "soccer_peru_primera_division",
+            "soccer_uruguay_primera_division", "soccer_venezuela_primera",
+            "soccer_conmebol_copa_libertadores", "soccer_conmebol_copa_sudamericana",
+        ]),
+        ("🌎 CONCACAF", [
+            "soccer_usa_mls", "soccer_mexico_ligamx",
+        ]),
+        ("🌏 Asia / Oceanía / Medio Oriente", [
+            "soccer_australia_aleague", "soccer_china_superleague",
+            "soccer_japan_j_league", "soccer_korea_kleague1",
+            "soccer_saudi_arabia_pro_league",
+        ]),
+    ]
+
+    # Leyenda
+    msg1 = (
+        "<b>📡 COBERTURA DE FUENTES POR LIGA</b>\n\n"
+        "<b>Nivel de datos en cada pick:</b>\n"
+        "🟢 Cuotas + Historial completo (football-data)\n"
+        "🟡 Cuotas + Estadísticas (API-Football)\n"
+        "🔵 Solo cuotas (sin historial)\n"
+        "❌ Sin cobertura (pick con datos mínimos)\n\n"
+        "<b>Fuentes:</b> 🎲=Odds API  📊=football-data  🏟️=API-Football\n"
+        "──────────────────────────\n"
+    )
+
+    blocks = []
+    for region_name, keys in REGIONS:
+        lines = [f"\n<b>{region_name}</b>"]
+        for key in keys:
+            name = SPORT_DISPLAY_NAMES.get(key, key)
+            has_odds = key in SOCCER_SPORTS
+            has_fd   = key in FD_COVERED
+            has_af   = key in SPORT_KEY_TO_LEAGUE
+            if has_odds and has_fd and has_af:
+                icon = "🟢"
+                srcs = "🎲📊🏟️"
+            elif has_odds and has_af:
+                icon = "🟡"
+                srcs = "🎲🏟️"
+            elif has_odds:
+                icon = "🔵"
+                srcs = "🎲"
+            else:
+                icon = "❌"
+                srcs = "—"
+            lines.append(f"  {icon} {name} <i>{srcs}</i>")
+        blocks.append("\n".join(lines))
+
+    # Sin cobertura conocida
+    no_cover = (
+        "\n<b>❌ Ligas sin cobertura en APIs</b>\n"
+        "  ❌ Primera Nacional ARG (2ª div)\n"
+        "  ❌ Ascenso MX (2ª div México)\n"
+        "  ❌ TAS (2ª div Argentina)\n"
+        "  ❌ Ligas regionales / amateur\n"
+        "  <i>→ Picks con 0-1/4 fuentes, usar con precaución</i>"
+    )
+    blocks.append(no_cover)
+
+    full_body = "\n".join(blocks)
+
+    # Telegram tiene límite de 4096 chars — dividir si es necesario
+    max_len = 4000
+    full_text = msg1 + full_body
+    if len(full_text) <= max_len:
+        await update.message.reply_text(full_text, parse_mode="HTML")
+    else:
+        await update.message.reply_text(msg1 + "\n".join(blocks[:5]), parse_mode="HTML")
+        await update.message.reply_text("\n".join(blocks[5:]), parse_mode="HTML")
+
+
 def main():
     if not TELEGRAM_TOKEN:
         logger.error("TELEGRAM_BOT_TOKEN no encontrado.")
@@ -1245,6 +1374,7 @@ def main():
     app.add_handler(CommandHandler("rendimiento", cmd_rendimiento))
     app.add_handler(CommandHandler("bankroll",    cmd_bankroll))
     app.add_handler(CommandHandler("api",         cmd_api))
+    app.add_handler(CommandHandler("fuentes",     cmd_fuentes))
     logger.info("Bot iniciado con todos los módulos activos.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
