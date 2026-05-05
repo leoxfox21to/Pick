@@ -916,55 +916,8 @@ async def _cmd_pick_from_cache(update: Update, context: ContextTypes.DEFAULT_TYP
         else:
             limited_note = ""
 
-        final_text = (
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"⚽ *{home_name}* vs *{away_name}*\n"
-            f"🏆 {competition} | 🕐 {time_cuba}"
-            f"{fuentes_str}"
-            f"{limited_note}\n"
-            f"━━━━━━━━━━━━━━━━━━━━"
-            f"{tabla_str}"
-            f"{coach_str}"
-            f"{racha_str}"
-            f"{fatigue_str}"
-            f"{cup_str}"
-            f"{referee_str}"
-            f"{susp_str}"
-            f"{injuries_str}"
-            f"{weather_str}"
-            f"{xg_str}"
-            f"{role_str}"
-            f"{ht_str}"
-            f"{poisson_str}"
-            f"{confidence_str}"
-            f"{form_str}"
-            f"{defense_str}"
-            f"{h2h_str}"
-            f"{odds_str}"
-            f"{movement_str}"
-            f"{efficiency_str}"
-            f"{conflict_str}"
-            f"{kelly_str}"
-            f"{value_str}"
-            f"{predictions_str}"
-            f"{expanded_markets_str}\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🤖 *ANÁLISIS IA:*\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"{ai_result}"
-        )
-        if auto_bet_info:
-            _bal = get_balance()
-            final_text += (
-                f"\n\n━━━━━━━━━━━━━━━━━━━━\n"
-                f"🤖 *AUTO-BET REGISTRADO:*\n"
-                f"💵 Apuesta: *${auto_bet_info['stake']:.2f}* @ {auto_bet_info['odds']}\n"
-                f"🎯 Pick: {auto_bet_info['pick_label']}\n"
-                f"💰 Ganancia potencial: *${auto_bet_info['potential_win']:.2f}*\n"
-                f"🏦 Balance actual: *${_bal:.2f}*"
-            )
-
         # ── Predicciones API-Football + Mercados extendidos ─────────────
+        # Se obtienen ANTES de final_text para que predictions_str esté definido
         if not apifb_fixture_id and league_id_for_extras:
             apifb_fixture_id = await asyncio.to_thread(
                 apifb_find_fixture, home_name, away_name,
@@ -1020,6 +973,54 @@ async def _cmd_pick_from_cache(update: Update, context: ContextTypes.DEFAULT_TYP
             )
         if _em_lines:
             expanded_markets_str = "\n\n📈 *Más mercados:*\n" + "\n".join(_em_lines)
+
+        final_text = (
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"⚽ *{home_name}* vs *{away_name}*\n"
+            f"🏆 {competition} | 🕐 {time_cuba}"
+            f"{fuentes_str}"
+            f"{limited_note}\n"
+            f"━━━━━━━━━━━━━━━━━━━━"
+            f"{tabla_str}"
+            f"{coach_str}"
+            f"{racha_str}"
+            f"{fatigue_str}"
+            f"{cup_str}"
+            f"{referee_str}"
+            f"{susp_str}"
+            f"{injuries_str}"
+            f"{weather_str}"
+            f"{xg_str}"
+            f"{role_str}"
+            f"{ht_str}"
+            f"{poisson_str}"
+            f"{confidence_str}"
+            f"{form_str}"
+            f"{defense_str}"
+            f"{h2h_str}"
+            f"{odds_str}"
+            f"{movement_str}"
+            f"{efficiency_str}"
+            f"{conflict_str}"
+            f"{kelly_str}"
+            f"{value_str}"
+            f"{predictions_str}"
+            f"{expanded_markets_str}\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🤖 *ANÁLISIS IA:*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"{ai_result}"
+        )
+        if auto_bet_info:
+            _bal = get_balance()
+            final_text += (
+                f"\n\n━━━━━━━━━━━━━━━━━━━━\n"
+                f"🤖 *AUTO-BET REGISTRADO:*\n"
+                f"💵 Apuesta: *${auto_bet_info['stake']:.2f}* @ {auto_bet_info['odds']}\n"
+                f"🎯 Pick: {auto_bet_info['pick_label']}\n"
+                f"💰 Ganancia potencial: *${auto_bet_info['potential_win']:.2f}*\n"
+                f"🏦 Balance actual: *${_bal:.2f}*"
+            )
 
         analyzed_matches.add(match_id)
         await msg.edit_text(final_text, parse_mode="Markdown")
